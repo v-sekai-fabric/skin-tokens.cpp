@@ -1,0 +1,19 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {"name":"debug","generator":"Ninja","binaryDir":"${sourceDir}/build/debug","cacheVariables":{"CMAKE_BUILD_TYPE":"Debug"}},
+    {"name":"release","generator":"Ninja","binaryDir":"${sourceDir}/build/release","cacheVariables":{"CMAKE_BUILD_TYPE":"Release"}},
+    {"name":"asan-ubsan","inherits":"debug","binaryDir":"${sourceDir}/build/asan-ubsan-clang","cacheVariables":{"CMAKE_C_COMPILER":"clang","CMAKE_CXX_COMPILER":"clang++","SKINTOKENS_CPU_ALL_VARIANTS":"OFF","SKINTOKENS_SANITIZE":"ON"}},
+    {"name":"fuzz","inherits":"asan-ubsan","binaryDir":"${sourceDir}/build/fuzz","cacheVariables":{"SKINTOKENS_BUILD_TESTS":"OFF","SKINTOKENS_ENABLE_VULKAN":"OFF","SKINTOKENS_FUZZ":"ON"}}
+  ],
+  "buildPresets": [
+    {"name":"debug","configurePreset":"debug"},
+    {"name":"release","configurePreset":"release"},
+    {"name":"asan-ubsan","configurePreset":"asan-ubsan"},
+    {"name":"fuzz","configurePreset":"fuzz"}
+  ],
+  "testPresets": [
+    {"name":"debug","configurePreset":"debug","output":{"outputOnFailure":true}},
+    {"name":"asan-ubsan","configurePreset":"asan-ubsan","output":{"outputOnFailure":true}}
+  ]
+}

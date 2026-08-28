@@ -1,0 +1,152 @@
+#pragma once
+
+#include <skintokens/skintokens.hpp>
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wshadow"
+#endif
+#include <ggml.h>
+#include <ggml-alloc.h>
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
+#include <gguf.h>
+#if defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#endif
+
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <unordered_map>
+
+namespace skintokens::detail {
+
+[[nodiscard]] inline error fail(error_code code, std::string message) {
+    return error{code, std::move(message)};
+}
+
+[[nodiscard]] inline bool checked_mul(std::size_t a, std::size_t b, std::size_t & result) {
+    if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) return false;
+    result = a * b;
+    return true;
+}
+
+struct backend_handle {
+    ggml_backend_t value = nullptr;
+    std::string name;
+    backend_handle() = default;
+    backend_handle(const backend_handle &) = delete;
+    backend_handle & operator=(const backend_handle &) = delete;
+    ~backend_handle();
+};
+
+[[nodiscard]] result<std::unique_ptr<backend_handle>> make_backend(
+    const runtime_options & options);
+
+struct bundle_metadata {
+    std::string architecture;
+    std::string component;
+    std::string upstream_revision;
+    std::string tokenrig_sha256;
+    std::string skin_vae_sha256;
+    std::uint64_t format_version = 0;
+    std::uint64_t tensor_count = 0;
+};
+
+struct weight_component {
+    ggml_context * context = nullptr;
+    gguf_context * file = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    std::filesystem::path path;
+    weight_component() = default;
+    weight_component(const weight_component &) = delete;
+    weight_component & operator=(const weight_component &) = delete;
+    ~weight_component();
+    [[nodiscard]] ggml_tensor * tensor(std::string_view name) const;
+};
+
+[[nodiscard]] result<std::unique_ptr<weight_component>> load_component(
+    const std::filesystem::path & path, ggml_backend_t backend);
+
+[[nodiscard]] result<bundle_metadata> inspect_gguf(
+    const std::filesystem::path & path);
+
+using tensor_snapshot = std::unordered_map<std::string, std::vector<float>>;
+
+// Qwen3 graph layout follows llama.cpp's Qwen3 implementation at the revision
+// recorded in NOTICE. It is expressed here against GGML directly; no llama.cpp
+// source or runtime is linked into this project.
+[[nodiscard]] result<tensor_snapshot> run_qwen_layer0(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> input, std::size_t sequence);
+
+[[nodiscard]] result<std::vector<float>> run_qwen_layer(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> input, std::size_t sequence, std::size_t layer);
+
+[[nodiscard]] result<std::vector<float>> run_qwen_head(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> input, std::size_t sequence);
+
+[[nodiscard]] result<std::vector<std::int32_t>> generate_skin_codes(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    std::span<const std::int32_t> skeleton_tokens,
+    std::size_t joint_count, const generation_options & options);
+
+struct generated_rig_tokens {
+    std::vector<std::int32_t> skeleton_tokens;
+    std::vector<std::int32_t> skin_codes;
+    std::size_t joint_count = 0;
+};
+
+// Generate TokenizerPart skeleton tokens followed by four FSQ skin codes per
+// generated joint. This is the checkpoint's normal, unconstrained TokenRig
+// route; supplied-skeleton generation above is a separate diagnostic lane.
+[[nodiscard]] result<generated_rig_tokens> generate_rig_tokens(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    const generation_options & options);
+
+[[nodiscard]] result<std::vector<float>> run_qwen_logits(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    std::span<const std::int32_t> tokens);
+
+struct skeleton_prefix {
+    std::vector<std::int32_t> tokens;
+    std::vector<vec3> normalized_vertices;
+    std::vector<vec3> normalized_joints;
+};
+
+[[nodiscard]] result<skeleton_prefix> tokenize_skeleton_prefix(
+    const mesh & source, const skeleton & target);
+
+[[nodiscard]] result<skeleton> detokenize_generated_skeleton(
+    std::span<const std::int32_t> tokens, vec3 center, float scale);
+
+[[nodiscard]] result<tensor_snapshot> run_mesh_encoder_fixture(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> points, std::span<const float> normals);
+
+[[nodiscard]] result<std::vector<float>> encode_mesh(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const vec3> points, std::span<const vec3> normals,
+    std::span<const std::int32_t> query_indices);
+
+[[nodiscard]] result<tensor_snapshot> run_skin_vae_fixture(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> points, std::span<const float> normals);
+
+[[nodiscard]] result<std::vector<float>> encode_skin_condition(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const vec3> points, std::span<const vec3> normals,
+    std::span<const std::int32_t> query_indices);
+
+[[nodiscard]] result<std::vector<float>> decode_skin_joint(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const std::int32_t> codes, std::span<const float> condition_latents,
+    std::span<const vec3> points, std::span<const vec3> normals);
+
+} // namespace skintokens::detail

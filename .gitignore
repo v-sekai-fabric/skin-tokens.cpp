@@ -1,0 +1,39 @@
+# Builds and local tooling
+/build/
+/build-*/
+/demo/build/
+/result
+/result-*
+/.direnv/
+/.cache/
+/.agents/
+/.codex/
+/compile_commands.json
+
+# Downloaded and generated assets
+/checkpoints/
+/generated/
+/models/*
+!/models/MANIFEST.md
+/fixtures/
+/demo-data/
+/reference/upstream/
+*.ckpt
+*.gguf
+*.safetensors
+*.pt
+*.pth
+
+# Compiler/test output
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.profraw
+*.profdata
+__pycache__/
+*.py[cod]
+.pytest_cache/

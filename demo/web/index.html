@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SkinTokens · LocalAI</title><link rel="stylesheet" href="/app.css"></head>
+<body><main>
+  <aside>
+    <header><div class="eyebrow">SKINTOKENS · GGML</div><h1><span>S</span> Bind and animate</h1>
+      <p>Import a trellis2cpp mesh and a Kimodo animation. SkinTokens predicts skin weights for the animation's fitted humanoid rig and exports an animated GLB.</p></header>
+    <section class="card">
+      <label for="meshSource">Character mesh</label><select id="meshSource"><option value="">Upload a mesh…</option></select>
+      <label class="file"><input id="mesh" type="file" accept=".glb,.t2mesh,model/gltf-binary"><b>Choose mesh GLB or T2MESH</b><small id="meshName">No upload selected</small></label>
+    </section>
+    <section class="card">
+      <label for="motionSource">Kimodo motion</label><select id="motionSource"><option value="">Upload a motion…</option></select>
+      <label class="file"><input id="motion" type="file" accept=".glb,model/gltf-binary"><b>Choose animation GLB</b><small id="motionName">No upload selected</small></label>
+    </section>
+    <button id="bind">Bind and animate</button><div id="status" class="status">Ready</div>
+    <div class="notice">Binding runs the released TokenRig and SkinVAE weights through GGML. Kimodo supplies the humanoid hierarchy; SkinTokens predicts mesh-specific weights. Detailed characters can take several minutes until generation gains a KV cache.</div>
+    <section class="history"><h2>Past bindings</h2><div id="history">Loading…</div></section>
+  </aside>
+  <section class="stage"><canvas id="view"></canvas><div class="empty" id="empty">Choose a completed binding to preview it</div>
+    <div class="compare-labels" id="compareLabels" hidden><span id="meshLabel">Animated mesh</span><span id="skeletonLabel">Driving skeleton</span></div>
+    <div class="joint-hover" id="jointHover" hidden></div>
+    <div class="controls"><button id="play">Pause</button><button id="rest">Rest pose</button><button id="reset">Reset view</button><a id="download" download="animation.glb" hidden>Download GLB</a><input id="timeline" type="range" min="0" max="1" step=".001" value="0"><span id="time">0:00 / 0:00</span></div>
+  </section>
+</main><a class="localai" href="https://localai.io" target="_blank" rel="noreferrer">LocalAI</a>
+<script src="/app.js"></script></body></html>

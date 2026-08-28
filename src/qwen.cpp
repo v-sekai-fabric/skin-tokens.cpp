@@ -1,0 +1,680 @@
+#include "internal.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <memory>
+#include <random>
+
+namespace skintokens::detail {
+namespace {
+
+constexpr std::int64_t hidden = 896;
+constexpr std::int64_t heads = 16;
+constexpr std::int64_t kv_heads = 8;
+constexpr std::int64_t head_dim = 128;
+
+ggml_tensor * required(const weight_component & weights, std::string_view name) {
+    auto * value = weights.tensor(name);
+    if (value == nullptr) throw std::runtime_error("missing TokenRig tensor: " + std::string{name});
+    return value;
+}
+
+ggml_tensor * linear(ggml_context * context, ggml_tensor * input, ggml_tensor * weight) {
+    auto * output = ggml_mul_mat(context, weight, input);
+    ggml_mul_mat_set_prec(output, GGML_PREC_F32);
+    return output;
+}
+
+ggml_tensor * rms(ggml_context * context, ggml_tensor * input, ggml_tensor * weight, float epsilon) {
+    auto * normalized = ggml_rms_norm(context, input, epsilon);
+    return ggml_mul(context, normalized, ggml_repeat(context, weight, normalized));
+}
+
+ggml_tensor * repeat_kv(ggml_context * context, ggml_tensor * value, std::int64_t sequence) {
+    auto * grouped = ggml_reshape_4d(context, value, head_dim, kv_heads, 1, sequence);
+    auto * shape = ggml_new_tensor_4d(context, value->type, head_dim, kv_heads, heads / kv_heads, sequence);
+    auto * repeated = ggml_repeat(context, grouped, shape);
+    repeated = ggml_cont(context, ggml_permute(context, repeated, 0, 2, 1, 3));
+    return ggml_reshape_3d(context, repeated, head_dim, heads, sequence);
+}
+
+std::vector<float> read_f32(ggml_tensor * tensor) {
+    const auto count = ggml_nelements(tensor);
+    if (count < 0) throw std::runtime_error("negative GGML tensor size");
+    std::vector<float> output(static_cast<std::size_t>(count));
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, output.data(), 0, output.size() * sizeof(float));
+        return output;
+    }
+    throw std::runtime_error("parity snapshot unexpectedly is not F32");
+}
+
+result<std::vector<float>> embed_tokens(const weight_component & weights, ggml_backend_t backend,
+                                        std::span<const std::int32_t> tokens) try {
+    if (tokens.empty()) return std::vector<float>{};
+    auto * context = ggml_init({8ULL << 20U, nullptr, true});
+    if (context == nullptr) return std::unexpected(fail(error_code::allocation, "cannot create token embedding graph"));
+    auto cleanup = std::unique_ptr<ggml_context, decltype(&ggml_free)>(context, ggml_free);
+    auto * ids = ggml_new_tensor_1d(context, GGML_TYPE_I32, static_cast<std::int64_t>(tokens.size()));
+    ggml_set_input(ids);
+    auto * output = ggml_get_rows(context, required(weights, "llm.tok.w"), ids);
+    auto * graph = ggml_new_graph_custom(context, 256, false); ggml_build_forward_expand(graph, output);
+    auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (allocator == nullptr || !ggml_gallocr_reserve(allocator, graph) || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator != nullptr) ggml_gallocr_free(allocator);
+        return std::unexpected(fail(error_code::allocation, "cannot allocate token embedding graph"));
+    }
+    auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    ggml_backend_tensor_set(ids, tokens.data(), 0, tokens.size_bytes());
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+        return std::unexpected(fail(error_code::compute, "token embedding graph execution failed"));
+    return read_f32(output);
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+std::int32_t sample_code(std::span<const float> logits, std::span<const std::int32_t> previous,
+                         const generation_options & options, std::mt19937_64 & random) {
+    constexpr std::int32_t first = 267;
+    constexpr std::int32_t count = 32768;
+    std::vector<std::pair<float, std::int32_t>> candidates;
+    candidates.reserve(static_cast<std::size_t>(count));
+    for (std::int32_t code = 0; code < count; ++code) {
+        const auto token = first + code;
+        float value = logits[static_cast<std::size_t>(token)];
+        if (options.repetition_penalty > 0.0F && options.repetition_penalty != 1.0F &&
+            std::find(previous.begin(), previous.end(), token) != previous.end())
+            value = value < 0.0F ? value * options.repetition_penalty : value / options.repetition_penalty;
+        candidates.emplace_back(value, token);
+    }
+    const std::size_t keep = options.top_k == 0U ? candidates.size() :
+        std::min<std::size_t>(options.top_k, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep), candidates.end(),
+        [](const auto & a, const auto & b) { return a.first > b.first; });
+    candidates.resize(keep);
+    if (options.temperature <= 0.0F || keep == 1U) return candidates.front().second;
+    const float maximum = candidates.front().first;
+    std::vector<double> probabilities(keep);
+    double total = 0.0;
+    for (std::size_t index = 0; index < keep; ++index) {
+        probabilities[index] = std::exp(static_cast<double>((candidates[index].first - maximum) / options.temperature));
+        total += probabilities[index];
+    }
+    if (options.top_p > 0.0F && options.top_p < 1.0F) {
+        double cumulative = 0.0;
+        std::size_t nucleus = 0;
+        for (; nucleus < probabilities.size(); ++nucleus) {
+            cumulative += probabilities[nucleus] / total;
+            if (cumulative >= options.top_p) { ++nucleus; break; }
+        }
+        nucleus = std::max<std::size_t>(1U, nucleus);
+        candidates.resize(nucleus); probabilities.resize(nucleus);
+    }
+    std::discrete_distribution<std::size_t> distribution(probabilities.begin(), probabilities.end());
+    return candidates[distribution(random)].second;
+}
+
+std::vector<std::pair<double, std::int32_t>> beam_candidates(
+    std::span<const float> logits, std::span<const std::int32_t> previous,
+    const generation_options & options) {
+    constexpr std::int32_t first = 267;
+    constexpr std::int32_t count = 32768;
+    const float maximum = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (const float value : logits) sum += std::exp(static_cast<double>(value - maximum));
+    const double normalization = static_cast<double>(maximum) + std::log(sum);
+    std::vector<std::pair<double, std::int32_t>> candidates;
+    candidates.reserve(static_cast<std::size_t>(count));
+    for (std::int32_t code = 0; code < count; ++code) {
+        const auto token = first + code;
+        double score = static_cast<double>(logits[static_cast<std::size_t>(token)]) - normalization;
+        if (options.repetition_penalty > 0.0F && options.repetition_penalty != 1.0F &&
+            std::find(previous.begin(), previous.end(), token) != previous.end())
+            score = score < 0.0 ? score * options.repetition_penalty : score / options.repetition_penalty;
+        if (options.temperature > 0.0F) score /= options.temperature;
+        candidates.emplace_back(score, token);
+    }
+    // Transformers 4.57 keeps two candidates per beam after top-k/top-p
+    // warping (one EOS plus one continuation), not 2*num_beams candidates.
+    const std::size_t minimum = options.beams > 1U ? 2U : 1U;
+    const std::size_t keep = options.top_k == 0U ? candidates.size() :
+        std::min(candidates.size(), std::max<std::size_t>(options.top_k, minimum));
+    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep), candidates.end(),
+        [](const auto & left, const auto & right) { return left.first > right.first; });
+    candidates.resize(keep);
+    if (options.top_p > 0.0F && options.top_p < 1.0F) {
+        const double peak = candidates.front().first;
+        double total = 0.0;
+        for (const auto & candidate : candidates) total += std::exp(candidate.first - peak);
+        double cumulative = 0.0;
+        std::size_t nucleus = 0U;
+        for (; nucleus < candidates.size(); ++nucleus) {
+            cumulative += std::exp(candidates[nucleus].first - peak) / total;
+            if (cumulative >= options.top_p && nucleus + 1U >= minimum) { ++nucleus; break; }
+        }
+        candidates.resize(std::max<std::size_t>(1U, nucleus));
+    }
+    return candidates;
+}
+
+enum class skeleton_state {
+    expect_bos,
+    expect_cls_or_part_or_joint,
+    expect_part_or_joint,
+    expect_joint_2,
+    expect_joint_3,
+    expect_branch_or_part_or_joint,
+    expect_joint,
+};
+
+struct skeleton_parse {
+    skeleton_state state = skeleton_state::expect_bos;
+    std::size_t joints = 0;
+    bool ended = false;
+};
+
+skeleton_parse parse_skeleton(std::span<const std::int32_t> ids) {
+    skeleton_parse output;
+    bool branch_half = false;
+    for (const auto id : ids) {
+        if (output.ended) throw std::runtime_error("tokens follow the skeleton terminator");
+        switch (output.state) {
+        case skeleton_state::expect_bos:
+            if (id != 257) throw std::runtime_error("skeleton token sequence does not start with BOS");
+            output.state = skeleton_state::expect_cls_or_part_or_joint; break;
+        case skeleton_state::expect_cls_or_part_or_joint:
+            if (id < 256) output.state = skeleton_state::expect_joint_2;
+            else if (id >= 263 && id <= 266) output.state = skeleton_state::expect_part_or_joint;
+            else if (id >= 260 && id <= 262) output.state = skeleton_state::expect_joint;
+            else throw std::runtime_error("invalid token after skeleton BOS");
+            break;
+        case skeleton_state::expect_part_or_joint:
+            if (id == 258) output.ended = true;
+            else if (id < 256) output.state = skeleton_state::expect_joint_2;
+            else if (id >= 260 && id <= 262) output.state = skeleton_state::expect_part_or_joint;
+            else throw std::runtime_error("invalid skeleton part/joint token");
+            break;
+        case skeleton_state::expect_joint_2:
+            if (id >= 256) throw std::runtime_error("invalid second coordinate token");
+            output.state = skeleton_state::expect_joint_3; break;
+        case skeleton_state::expect_joint_3:
+            if (id >= 256) throw std::runtime_error("invalid third coordinate token");
+            if (branch_half) branch_half = false;
+            else ++output.joints;
+            output.state = skeleton_state::expect_branch_or_part_or_joint; break;
+        case skeleton_state::expect_branch_or_part_or_joint:
+            if (id == 258) output.ended = true;
+            else if (id == 256) { output.state = skeleton_state::expect_joint; branch_half = true; }
+            else if (id < 256) output.state = skeleton_state::expect_joint_2;
+            else if (id >= 260 && id <= 262) output.state = skeleton_state::expect_joint;
+            else throw std::runtime_error("invalid token between skeleton joints");
+            break;
+        case skeleton_state::expect_joint:
+            if (id >= 256) throw std::runtime_error("expected skeleton coordinate token");
+            output.state = skeleton_state::expect_joint_2; break;
+        }
+    }
+    return output;
+}
+
+std::vector<std::int32_t> allowed_skeleton_tokens(const skeleton_parse & parsed) {
+    std::vector<std::int32_t> output;
+    const auto coordinates = [&] { for (std::int32_t id = 0; id < 256; ++id) output.push_back(id); };
+    const auto parts = [&] { output.insert(output.end(), {260, 261, 262}); };
+    switch (parsed.state) {
+    case skeleton_state::expect_bos: output.push_back(257); break;
+    case skeleton_state::expect_cls_or_part_or_joint:
+        output.insert(output.end(), {263, 264, 265, 266}); parts(); coordinates(); break;
+    case skeleton_state::expect_part_or_joint:
+        parts(); coordinates(); if (parsed.joints != 0U) output.push_back(258); break;
+    case skeleton_state::expect_joint_2:
+    case skeleton_state::expect_joint_3:
+    case skeleton_state::expect_joint: coordinates(); break;
+    case skeleton_state::expect_branch_or_part_or_joint:
+        coordinates(); parts(); output.push_back(256); if (parsed.joints != 0U) output.push_back(258); break;
+    }
+    return output;
+}
+
+std::vector<std::pair<double, std::int32_t>> masked_candidates(
+    std::span<const float> logits, std::span<const std::int32_t> allowed,
+    std::span<const std::int32_t> previous, const generation_options & options) {
+    if (allowed.empty()) return {};
+    const float maximum = *std::max_element(logits.begin(), logits.end());
+    double full_sum = 0.0;
+    for (const float value : logits) full_sum += std::exp(static_cast<double>(value - maximum));
+    const double full_normalization = static_cast<double>(maximum) + std::log(full_sum);
+    std::vector<std::pair<double, std::int32_t>> candidates;
+    candidates.reserve(allowed.size());
+    for (const auto token : allowed) {
+        // Transformers beam sampling applies log_softmax over the complete
+        // vocabulary before all logits processors/warpers, and does not
+        // renormalize each beam after the grammar mask.
+        double value = static_cast<double>(logits[static_cast<std::size_t>(token)]) - full_normalization;
+        if (options.repetition_penalty > 0.0F && options.repetition_penalty != 1.0F &&
+            std::find(previous.begin(), previous.end(), token) != previous.end())
+            value = value < 0.0 ? value * options.repetition_penalty : value / options.repetition_penalty;
+        if (options.temperature > 0.0F) value /= options.temperature;
+        candidates.emplace_back(value, token);
+    }
+    const std::size_t minimum = std::min(candidates.size(),
+        static_cast<std::size_t>(options.beams > 1U ? 2U : 1U));
+    const std::size_t keep = options.top_k == 0U ? candidates.size() :
+        std::min(candidates.size(), std::max<std::size_t>(options.top_k, minimum));
+    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep), candidates.end(),
+        [](const auto & a, const auto & b) { return a.first > b.first; });
+    candidates.resize(keep);
+    if (options.top_p > 0.0F && options.top_p < 1.0F && candidates.size() > minimum) {
+        const double local_peak = candidates.front().first;
+        double local_sum = 0.0;
+        for (const auto & candidate : candidates) local_sum += std::exp(candidate.first - local_peak);
+        double cumulative = 0.0; std::size_t nucleus = 0;
+        for (; nucleus < candidates.size(); ++nucleus) {
+            cumulative += std::exp(candidates[nucleus].first - local_peak) / local_sum;
+            if (cumulative >= options.top_p && nucleus + 1U >= minimum) { ++nucleus; break; }
+        }
+        candidates.resize(std::max<std::size_t>(1U, nucleus));
+    }
+    return candidates;
+}
+
+} // namespace
+
+result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_backend_t backend,
+                                        std::span<const float> input, std::size_t sequence) try {
+    if (backend == nullptr || sequence == 0U || sequence > 3192U ||
+        input.size() != sequence * static_cast<std::size_t>(hidden))
+        return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen layer parity input"));
+    auto * context = ggml_init({96ULL << 20U, nullptr, true});
+    if (context == nullptr)
+        return std::unexpected(fail(error_code::allocation, "cannot create Qwen graph context"));
+    auto cleanup = std::unique_ptr<ggml_context, decltype(&ggml_free)>(context, ggml_free);
+    const auto seq = static_cast<std::int64_t>(sequence);
+    auto * x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, seq);
+    auto * positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, seq);
+    ggml_set_input(x);
+    ggml_set_input(positions);
+
+    auto * attn_norm = rms(context, x, required(weights, "llm.l.0.an.w"), 1e-6F);
+    auto * q_linear = linear(context, attn_norm, required(weights, "llm.l.0.attn.q.w"));
+    auto * k_linear = linear(context, attn_norm, required(weights, "llm.l.0.attn.k.w"));
+    auto * v_linear = linear(context, attn_norm, required(weights, "llm.l.0.attn.v.w"));
+    auto * q = ggml_reshape_3d(context, q_linear, head_dim, heads, seq);
+    auto * k = ggml_reshape_3d(context, k_linear, head_dim, kv_heads, seq);
+    auto * v = ggml_reshape_3d(context, v_linear, head_dim, kv_heads, seq);
+    auto * q_norm = rms(context, q, required(weights, "llm.l.0.attn.q_norm.w"), 1e-6F);
+    auto * k_norm = rms(context, k, required(weights, "llm.l.0.attn.k_norm.w"), 1e-6F);
+    q = ggml_rope_ext(context, q_norm, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    k = ggml_rope_ext(context, k_norm, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    auto * q_rope = q;
+    auto * k_rope = k;
+    k = repeat_kv(context, k, seq);
+    v = repeat_kv(context, v, seq);
+    q = ggml_permute(context, q, 0, 2, 1, 3);
+    k = ggml_permute(context, k, 0, 2, 1, 3);
+    v = ggml_permute(context, v, 0, 2, 1, 3);
+    auto * scores = ggml_mul_mat(context, k, q);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim)));
+    auto * raw_scores = scores;
+    scores = ggml_diag_mask_inf(context, scores, 0);
+    auto * probabilities = ggml_soft_max(context, scores);
+    v = ggml_cont(context, ggml_transpose(context, v));
+    auto * attention = ggml_mul_mat(context, v, probabilities);
+    ggml_mul_mat_set_prec(attention, GGML_PREC_F32);
+    attention = ggml_cont(context, ggml_permute(context, attention, 0, 2, 1, 3));
+    auto * o_linear = linear(context, ggml_reshape_2d(context, attention, heads * head_dim, seq),
+                             required(weights, "llm.l.0.attn.o.w"));
+    auto * state = ggml_add(context, x, o_linear);
+    auto * ffn_norm = rms(context, state, required(weights, "llm.l.0.fn.w"), 1e-6F);
+    auto * gate_linear = linear(context, ffn_norm, required(weights, "llm.l.0.mlp.g.w"));
+    auto * up_linear = linear(context, ffn_norm, required(weights, "llm.l.0.mlp.u.w"));
+    auto * activated = ggml_mul(context, ggml_silu(context, gate_linear), up_linear);
+    auto * down_linear = linear(context, activated, required(weights, "llm.l.0.mlp.d.w"));
+    auto * layer_output = ggml_add(context, state, down_linear);
+
+    auto * attention_flat = ggml_reshape_2d(context, attention, heads * head_dim, seq);
+    const std::pair<const char *, ggml_tensor *> snapshots[] = {
+        {"attn_norm", attn_norm}, {"q_linear", q_linear}, {"k_linear", k_linear},
+        {"v_linear", v_linear}, {"q_norm", q_norm}, {"k_norm", k_norm},
+        {"q_rope", q_rope}, {"k_rope", k_rope}, {"scores", raw_scores},
+        {"probabilities", probabilities}, {"attention", attention_flat},
+        {"o_linear", o_linear}, {"ffn_norm", ffn_norm}, {"gate_linear", gate_linear},
+        {"up_linear", up_linear}, {"down_linear", down_linear}, {"layer_output", layer_output},
+    };
+    for (const auto & [name, tensor] : snapshots) {
+        (void) name;
+        ggml_set_output(tensor);
+    }
+    auto * graph = ggml_new_graph_custom(context, 4096, false);
+    for (const auto & [name, tensor] : snapshots) {
+        (void) name;
+        ggml_build_forward_expand(graph, tensor);
+    }
+    auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (allocator == nullptr || !ggml_gallocr_reserve(allocator, graph) || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator != nullptr) ggml_gallocr_free(allocator);
+        return std::unexpected(fail(error_code::allocation, "cannot allocate Qwen layer graph"));
+    }
+    auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    std::vector<std::int32_t> position_values(sequence);
+    for (std::size_t index = 0; index < sequence; ++index)
+        position_values[index] = static_cast<std::int32_t>(index);
+    ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
+    ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+        return std::unexpected(fail(error_code::compute, "Qwen layer graph execution failed"));
+    tensor_snapshot output;
+    for (const auto & [name, tensor] : snapshots) output.emplace(name, read_f32(tensor));
+    return output;
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml_backend_t backend,
+                                          std::span<const float> input, std::size_t sequence,
+                                          std::size_t layer) try {
+    if (backend == nullptr || sequence == 0U || sequence > 3192U || layer >= 28U ||
+        input.size() != sequence * static_cast<std::size_t>(hidden))
+        return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen layer input"));
+    auto * context = ggml_init({64ULL << 20U, nullptr, true});
+    if (context == nullptr) return std::unexpected(fail(error_code::allocation, "cannot create Qwen graph context"));
+    auto cleanup = std::unique_ptr<ggml_context, decltype(&ggml_free)>(context, ggml_free);
+    const auto seq = static_cast<std::int64_t>(sequence);
+    const std::string prefix = "llm.l." + std::to_string(layer) + ".";
+    auto get = [&](std::string_view suffix) { return required(weights, prefix + std::string{suffix}); };
+    auto * x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, seq);
+    auto * positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, seq);
+    ggml_set_input(x); ggml_set_input(positions);
+    auto * normalized = rms(context, x, get("an.w"), 1e-6F);
+    auto * q = ggml_reshape_3d(context, linear(context, normalized, get("attn.q.w")), head_dim, heads, seq);
+    auto * k = ggml_reshape_3d(context, linear(context, normalized, get("attn.k.w")), head_dim, kv_heads, seq);
+    auto * v = ggml_reshape_3d(context, linear(context, normalized, get("attn.v.w")), head_dim, kv_heads, seq);
+    q = rms(context, q, get("attn.q_norm.w"), 1e-6F);
+    k = rms(context, k, get("attn.k_norm.w"), 1e-6F);
+    q = ggml_rope_ext(context, q, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    k = ggml_rope_ext(context, k, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    k = repeat_kv(context, k, seq); v = repeat_kv(context, v, seq);
+    q = ggml_permute(context, q, 0, 2, 1, 3);
+    k = ggml_permute(context, k, 0, 2, 1, 3);
+    v = ggml_permute(context, v, 0, 2, 1, 3);
+    auto * scores = ggml_mul_mat(context, k, q);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_diag_mask_inf(context,
+        ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim))), 0);
+    auto * attended = ggml_mul_mat(context, ggml_cont(context, ggml_transpose(context, v)),
+                                   ggml_soft_max(context, scores));
+    ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
+    attended = ggml_cont(context, ggml_permute(context, attended, 0, 2, 1, 3));
+    auto * state = ggml_add(context, x, linear(context,
+        ggml_reshape_2d(context, attended, heads * head_dim, seq), get("attn.o.w")));
+    normalized = rms(context, state, get("fn.w"), 1e-6F);
+    auto * gate = ggml_silu(context, linear(context, normalized, get("mlp.g.w")));
+    auto * up = linear(context, normalized, get("mlp.u.w"));
+    auto * output = ggml_add(context, state,
+        linear(context, ggml_mul(context, gate, up), get("mlp.d.w")));
+    auto * graph = ggml_new_graph_custom(context, 4096, false);
+    ggml_build_forward_expand(graph, output);
+    auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (allocator == nullptr || !ggml_gallocr_reserve(allocator, graph) || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator != nullptr) ggml_gallocr_free(allocator);
+        return std::unexpected(fail(error_code::allocation, "cannot allocate Qwen layer graph"));
+    }
+    auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    std::vector<std::int32_t> position_values(sequence);
+    for (std::size_t index = 0; index < sequence; ++index) position_values[index] = static_cast<std::int32_t>(index);
+    ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
+    ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+        return std::unexpected(fail(error_code::compute, "Qwen layer graph execution failed"));
+    return read_f32(output);
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+result<std::vector<float>> run_qwen_head(const weight_component & weights, ggml_backend_t backend,
+                                         std::span<const float> input, std::size_t sequence) try {
+    if (backend == nullptr || sequence == 0U || input.size() != sequence * static_cast<std::size_t>(hidden))
+        return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen head input"));
+    auto * context = ggml_init({16ULL << 20U, nullptr, true});
+    if (context == nullptr) return std::unexpected(fail(error_code::allocation, "cannot create Qwen head context"));
+    auto cleanup = std::unique_ptr<ggml_context, decltype(&ggml_free)>(context, ggml_free);
+    auto * x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, static_cast<std::int64_t>(sequence));
+    ggml_set_input(x);
+    auto * final_norm = rms(context, x, required(weights, "llm.norm.w"), 1e-6F);
+    auto * last = ggml_view_2d(context, final_norm, hidden, 1, final_norm->nb[1],
+                              (sequence - 1U) * final_norm->nb[1]);
+    auto * logits = linear(context, last, required(weights, "llm.out.w"));
+    auto * graph = ggml_new_graph_custom(context, 1024, false);
+    ggml_build_forward_expand(graph, logits);
+    auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (allocator == nullptr || !ggml_gallocr_reserve(allocator, graph) || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator != nullptr) ggml_gallocr_free(allocator);
+        return std::unexpected(fail(error_code::allocation, "cannot allocate Qwen head graph"));
+    }
+    auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+        return std::unexpected(fail(error_code::compute, "Qwen head graph execution failed"));
+    return read_f32(logits);
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+result<std::vector<float>> run_qwen_logits(const weight_component & weights, ggml_backend_t backend,
+                                            std::span<const float> mesh_embeddings,
+                                            std::span<const std::int32_t> tokens) {
+    if (backend == nullptr || mesh_embeddings.empty() ||
+        mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U || tokens.empty())
+        return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen logits input"));
+    auto token_state = embed_tokens(weights, backend, tokens);
+    if (!token_state) return std::unexpected(token_state.error());
+    std::vector<float> state;
+    state.reserve(mesh_embeddings.size() + token_state->size());
+    state.insert(state.end(), mesh_embeddings.begin(), mesh_embeddings.end());
+    state.insert(state.end(), token_state->begin(), token_state->end());
+    const std::size_t sequence = state.size() / static_cast<std::size_t>(hidden);
+    if (sequence > 3192U)
+        return std::unexpected(fail(error_code::limit_exceeded, "TokenRig sequence exceeds Qwen context"));
+    for (std::size_t layer = 0; layer < 28U; ++layer) {
+        auto next = run_qwen_layer(weights, backend, state, sequence, layer);
+        if (!next) return std::unexpected(next.error());
+        state = std::move(*next);
+    }
+    return run_qwen_head(weights, backend, state, sequence);
+}
+
+result<std::vector<std::int32_t>> generate_skin_codes(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings, std::span<const std::int32_t> skeleton_tokens,
+    std::size_t joint_count, const generation_options & options) try {
+    if (backend == nullptr || mesh_embeddings.empty() || mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U ||
+        skeleton_tokens.empty() || joint_count == 0U || joint_count > 256U || options.top_p < 0.0F ||
+        options.top_p > 1.0F || options.beams == 0U || options.beams > 32U ||
+        !std::isfinite(options.temperature) || !std::isfinite(options.repetition_penalty))
+        return std::unexpected(fail(error_code::invalid_argument, "invalid TokenRig generation input"));
+    const std::size_t wanted = joint_count * 4U;
+    if (wanted > options.max_tokens)
+        return std::unexpected(fail(error_code::limit_exceeded, "generation token limit is smaller than four codes per joint"));
+    std::mt19937_64 random{options.seed};
+    std::vector<std::int32_t> generated;
+    if (options.beams == 1U) {
+        generated.reserve(wanted);
+        while (generated.size() < wanted) {
+            std::vector<std::int32_t> tokens{skeleton_tokens.begin(), skeleton_tokens.end()};
+            tokens.insert(tokens.end(), generated.begin(), generated.end());
+            auto logits = run_qwen_logits(weights, backend, mesh_embeddings, tokens);
+            if (!logits) return std::unexpected(logits.error());
+            generated.push_back(sample_code(*logits, generated, options, random));
+        }
+    } else {
+        struct beam_state { std::vector<std::int32_t> tokens; double score = 0.0; };
+        struct continuation { std::size_t source; std::int32_t token; double score; };
+        std::vector<beam_state> beams(1U);
+        while (beams.front().tokens.size() < wanted) {
+            std::vector<continuation> choices;
+            for (std::size_t beam = 0; beam < beams.size(); ++beam) {
+                std::vector<std::int32_t> tokens{skeleton_tokens.begin(), skeleton_tokens.end()};
+                tokens.insert(tokens.end(), beams[beam].tokens.begin(), beams[beam].tokens.end());
+                auto logits = run_qwen_logits(weights, backend, mesh_embeddings, tokens);
+                if (!logits) return std::unexpected(logits.error());
+                for (const auto & [score, token] : beam_candidates(*logits, beams[beam].tokens, options))
+                    choices.push_back({beam, token, beams[beam].score + score});
+            }
+            const std::size_t wanted_choices = std::min<std::size_t>(static_cast<std::size_t>(options.beams) * 2U, choices.size());
+            std::vector<continuation> selected;
+            selected.reserve(wanted_choices);
+            if (options.temperature > 0.0F) {
+                while (selected.size() < wanted_choices) {
+                    const double peak = std::max_element(choices.begin(), choices.end(),
+                        [](const auto & left, const auto & right) { return left.score < right.score; })->score;
+                    std::vector<double> probabilities(choices.size());
+                    for (std::size_t i = 0; i < choices.size(); ++i)
+                        probabilities[i] = std::exp(choices[i].score - peak);
+                    std::discrete_distribution<std::size_t> distribution(probabilities.begin(), probabilities.end());
+                    const std::size_t index = distribution(random);
+                    selected.push_back(choices[index]);
+                    choices.erase(choices.begin() + static_cast<std::ptrdiff_t>(index));
+                }
+            } else {
+                std::partial_sort(choices.begin(), choices.begin() + static_cast<std::ptrdiff_t>(wanted_choices), choices.end(),
+                    [](const auto & left, const auto & right) { return left.score > right.score; });
+                selected.assign(choices.begin(), choices.begin() + static_cast<std::ptrdiff_t>(wanted_choices));
+            }
+            std::sort(selected.begin(), selected.end(),
+                [](const auto & left, const auto & right) { return left.score > right.score; });
+            const std::size_t keep = std::min<std::size_t>(options.beams, selected.size());
+            std::vector<beam_state> next;
+            next.reserve(keep);
+            for (std::size_t i = 0; i < keep; ++i) {
+                beam_state value = beams[selected[i].source];
+                value.tokens.push_back(selected[i].token);
+                value.score = selected[i].score;
+                next.push_back(std::move(value));
+            }
+            beams = std::move(next);
+        }
+        generated = std::move(beams.front().tokens);
+    }
+    for (auto & token : generated) token -= 267;
+    return generated;
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+result<generated_rig_tokens> generate_rig_tokens(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings, const generation_options & options) try {
+    if (backend == nullptr || mesh_embeddings.empty() ||
+        mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U ||
+        options.beams == 0U || options.beams > 32U || options.max_tokens < 8U ||
+        options.top_p < 0.0F || options.top_p > 1.0F)
+        return std::unexpected(fail(error_code::invalid_argument, "invalid unconstrained TokenRig generation input"));
+    // `articulation` is the class used by the released inference dataset.
+    constexpr std::int32_t start[]{257, 266};
+    constexpr std::int32_t first_skin = 267;
+    constexpr std::int32_t last_skin = 33034;
+    constexpr std::int32_t final_eos = 33035;
+    struct beam_state { std::vector<std::int32_t> tokens; double score = 0.0; };
+    struct choice { std::size_t source; std::int32_t token; double score; };
+    std::vector<beam_state> active{{std::vector<std::int32_t>{std::begin(start), std::end(start)}, 0.0}}, finished;
+    std::mt19937_64 random{options.seed};
+    for (std::size_t step = 0; step < options.max_tokens && !active.empty(); ++step) {
+        std::vector<choice> choices;
+        for (std::size_t beam = 0; beam < active.size(); ++beam) {
+            const auto skeleton_end = std::find(active[beam].tokens.begin(), active[beam].tokens.end(), 258);
+            std::vector<std::int32_t> allowed;
+            if (skeleton_end == active[beam].tokens.end()) {
+                const auto parsed = parse_skeleton(active[beam].tokens);
+                allowed = allowed_skeleton_tokens(parsed);
+            } else {
+                const auto skeleton_size = static_cast<std::size_t>(skeleton_end - active[beam].tokens.begin()) + 1U;
+                const auto parsed = parse_skeleton(std::span{active[beam].tokens.data(), skeleton_size});
+                const std::size_t codes = active[beam].tokens.size() - skeleton_size;
+                if (parsed.joints == 0U || parsed.joints > 256U) continue;
+                // The released processor counts the skeleton switch itself in
+                // the J*4 span. Consequently EOS is the fourth FSQ value of
+                // the final joint (index 32768 after subtracting vocab_size).
+                if (codes + 1U < parsed.joints * 4U) {
+                    allowed.reserve(static_cast<std::size_t>(last_skin - 258 + 1));
+                    for (std::int32_t token = 258; token <= last_skin; ++token) allowed.push_back(token);
+                } else if (codes + 1U == parsed.joints * 4U) allowed.push_back(final_eos);
+                else continue;
+            }
+            auto logits = run_qwen_logits(weights, backend, mesh_embeddings, active[beam].tokens);
+            if (!logits) return std::unexpected(logits.error());
+            for (const auto & [score, token] : masked_candidates(*logits, allowed, active[beam].tokens, options))
+                choices.push_back({beam, token, active[beam].score + score});
+        }
+        if (choices.empty()) break;
+        const std::size_t wanted = std::min(choices.size(), static_cast<std::size_t>(options.beams) * 2U);
+        std::vector<choice> selected; selected.reserve(wanted);
+        if (options.temperature > 0.0F) {
+            while (selected.size() < wanted && !choices.empty()) {
+                const double peak = std::max_element(choices.begin(), choices.end(),
+                    [](const auto & a, const auto & b) { return a.score < b.score; })->score;
+                std::vector<double> probabilities(choices.size());
+                for (std::size_t i = 0; i < choices.size(); ++i) probabilities[i] = std::exp(choices[i].score - peak);
+                std::discrete_distribution<std::size_t> distribution(probabilities.begin(), probabilities.end());
+                const std::size_t index = distribution(random);
+                selected.push_back(choices[index]);
+                choices.erase(choices.begin() + static_cast<std::ptrdiff_t>(index));
+            }
+        } else {
+            std::partial_sort(choices.begin(), choices.begin() + static_cast<std::ptrdiff_t>(wanted), choices.end(),
+                [](const auto & a, const auto & b) { return a.score > b.score; });
+            selected.assign(choices.begin(), choices.begin() + static_cast<std::ptrdiff_t>(wanted));
+        }
+        std::sort(selected.begin(), selected.end(), [](const auto & a, const auto & b) { return a.score > b.score; });
+        std::vector<beam_state> next;
+        for (const auto & selected_choice : selected) {
+            auto value = active[selected_choice.source]; value.tokens.push_back(selected_choice.token);
+            value.score = selected_choice.score;
+            if (selected_choice.token == final_eos) finished.push_back(std::move(value));
+            else if (next.size() < options.beams) next.push_back(std::move(value));
+        }
+        active = std::move(next);
+        if (finished.size() >= options.beams) break;
+    }
+    if (finished.empty()) {
+        std::size_t switched = 0U, maximum_joints = 0U, maximum_length = 0U;
+        for (const auto & beam : active) {
+            maximum_length = std::max(maximum_length, beam.tokens.size());
+            const auto end = std::find(beam.tokens.begin(), beam.tokens.end(), 258);
+            const std::size_t size = end == beam.tokens.end() ? beam.tokens.size() :
+                static_cast<std::size_t>(end - beam.tokens.begin()) + 1U;
+            const auto parsed = parse_skeleton(std::span{beam.tokens.data(), size});
+            maximum_joints = std::max(maximum_joints, parsed.joints);
+            if (end != beam.tokens.end()) ++switched;
+        }
+        return std::unexpected(fail(error_code::compute,
+            "TokenRig did not complete within the token limit (active=" + std::to_string(active.size()) +
+            ", switched=" + std::to_string(switched) + ", max_joints=" + std::to_string(maximum_joints) +
+            ", max_sequence=" + std::to_string(maximum_length) + ")"));
+    }
+    const auto best = std::max_element(finished.begin(), finished.end(), [](const auto & a, const auto & b) {
+        const double as = a.score / static_cast<double>(a.tokens.size() - 2U);
+        const double bs = b.score / static_cast<double>(b.tokens.size() - 2U);
+        return as < bs;
+    });
+    const auto skeleton_end = std::find(best->tokens.begin(), best->tokens.end(), 258);
+    const std::size_t skeleton_size = static_cast<std::size_t>(skeleton_end - best->tokens.begin()) + 1U;
+    const auto parsed = parse_skeleton(std::span{best->tokens.data(), skeleton_size});
+    generated_rig_tokens output;
+    output.skeleton_tokens.assign(best->tokens.begin(), skeleton_end + 1);
+    output.skin_codes.assign(skeleton_end + 1, best->tokens.end());
+    for (auto & code : output.skin_codes) code -= first_skin;
+    output.joint_count = parsed.joints;
+    if (output.skin_codes.size() != output.joint_count * 4U)
+        return std::unexpected(fail(error_code::compute, "TokenRig generated an incomplete skin-code sequence"));
+    return output;
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+} // namespace skintokens::detail
