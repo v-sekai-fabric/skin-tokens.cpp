@@ -2,11 +2,14 @@
 
 A C++23/GGML port of
 [SkinTokens / TokenRig](https://github.com/VAST-AI-Research/SkinTokens) for
-automatic skeleton and skin-weight generation on CPU or Vulkan. The primary
-integration takes a mesh exported by trellis2cpp and an animated skeleton GLB
-exported by Kimodo. The runtime fits Kimodo's humanoid hierarchy to the mesh,
-TokenRig predicts its skin codes, and SkinVAE decodes dense weights before a
-portable animated GLB is written.
+automatic skeleton and skin-weight generation on CPU or Vulkan.
+
+Skin weights say how strongly every mesh vertex follows each bone. Without
+them, moving a skeleton does not deform the character surface correctly.
+SkinTokens takes a static mesh, predicts a suitable skeleton and its vertex
+weights, and writes a portable rigged GLB. It can be used directly with an
+arbitrary mesh; neither Trellis2 nor Kimodo is required. An existing skeleton
+can also be supplied when a particular animation hierarchy must be retained.
 
 ## Build and install on Linux
 
@@ -26,7 +29,7 @@ and enabled dynamic backends. To test from the build tree:
 
 ```sh
 ctest --test-dir build/release --output-on-failure
-./build/release/bin/skintokens-cli inspect models/skintokens-f32
+./build/release/bin/skintokens-cli inspect models/SkinTokens-GGUF/F16
 ```
 
 Nix is optional. It supplies the build tools and Vulkan development packages,
@@ -47,6 +50,39 @@ cmake --preset asan-ubsan
 cmake --build --preset asan-ubsan -j
 ctest --preset asan-ubsan
 ```
+
+## Download the weights
+
+Downloading the converted F16 GGUF bundle is the recommended setup. With the
+[Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli):
+
+```sh
+hf download LocalAI-io/SkinTokens-GGUF \
+  --include "F16/*" \
+  --local-dir models/SkinTokens-GGUF
+```
+
+Use `models/SkinTokens-GGUF/F16` as `MODEL_DIR` in the commands below. The
+repository also contains an F32 bundle for numerical parity work; normal
+inference should use F16.
+
+## Rig an arbitrary mesh
+
+The standalone path needs only a static `.glb` mesh. It generates the skeleton
+and learned skin weights, then stores a one-frame rest pose in the output so it
+opens as a conventional skinned glTF asset:
+
+```sh
+./build/release/bin/skintokens-cli rig \
+  models/SkinTokens-GGUF/F16 \
+  character.glb character-rigged.glb \
+  --device vulkan --postprocess
+```
+
+The model accepts arbitrary triangle meshes, although—as with any learned
+rigging model—results are strongest on shapes resembling its training
+distribution. `--postprocess` enables the upstream surface-locality heuristic;
+omit it to preserve the raw learned weights exactly.
 
 ## Status
 
@@ -87,10 +123,12 @@ the upstream demo's opt-in setting rather than being silently enabled.
 
 Use `--device vulkan`, `--device cpu`, or `--device auto` at runtime.
 
-## Download and convert
+## Convert the upstream checkpoints yourself
 
-The two official checkpoints are MIT-labelled but use Lightning pickle
-containers. Downloads are explicit, hash-checked, and excluded from git:
+This is an advanced reproducibility path; most users should download the GGUF
+bundle above. The two official checkpoints are MIT-labelled but use Lightning
+pickle containers. Downloads are explicit, hash-checked, and excluded from
+git:
 
 ```sh
 ./scripts/download_models.sh checkpoints
@@ -111,14 +149,19 @@ The normal converter accepts safetensors only. Every GGUF component records
 the upstream revision and both intermediate SHA-256 identities, and model load
 rejects mixed bundles.
 
-## Intended workflow
+## Optional end-to-end humanoid pipeline: Trellis2 + Kimodo
+
+Trellis2 can generate and remesh a humanoid, Kimodo can generate its motion,
+and skin-tokens.cpp can bind that motion hierarchy to the mesh. This is a
+concrete full animated-asset pipeline, not a dependency or requirement of
+SkinTokens:
 
 ```sh
 trellis2cpp/build/examples/mesh2glb \
   trellis-mesh.t2mesh trellis-remeshed.glb 2048 \
   --print 0.5 0.0166667 --quad 20000
 ./build/release/bin/skintokens-cli bind \
-  models/skintokens-f32 \
+  models/SkinTokens-GGUF/F16 \
   trellis-remeshed.glb kimodo-animation.glb character-animated.glb \
   --device vulkan --supplied-skeleton
 ```
@@ -130,7 +173,7 @@ anatomy, and uses an explicit semantic motion map:
 
 ```sh
 ./build/release/bin/skintokens-cli bind \
-  models/skintokens-f32 \
+  models/SkinTokens-GGUF/F16 \
   character.glb kimodo-soma30.glb character-mixamo.glb \
   --device vulkan --supplied-skeleton --target-rig mixamo52
 
@@ -176,7 +219,7 @@ char error[512];
 st_model *model = NULL;
 st_runtime_options runtime = st_default_runtime_options();
 runtime.device = ST_DEVICE_VULKAN;
-if (st_model_load("models/skintokens-f16", &runtime, &model,
+if (st_model_load("models/SkinTokens-GGUF/F16", &runtime, &model,
                   error, sizeof(error)) != ST_OK) {
     /* report error */
 }
@@ -209,7 +252,7 @@ cd demo
 go run . \
   --listen 127.0.0.1:8095 \
   --cli ../build/release/bin/skintokens-cli \
-  --model ../models/skintokens-f32 \
+  --model ../models/SkinTokens-GGUF/F16 \
   --kimodo /path/to/kimodo/gallery \
   --trellis /path/to/trellis/gallery \
   --trellis-mesh2glb /path/to/trellis2cpp/mesh2glb

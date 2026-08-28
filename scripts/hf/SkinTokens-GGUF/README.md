@@ -18,6 +18,10 @@ GGUF F16 and F32 conversions of
 GGML CPU/Vulkan implementation of TokenRig and SkinVAE. These files are a
 format/precision conversion of the released model; they were not retrained.
 
+SkinTokens predicts a skeleton and vertex-to-bone skin weights for a static
+mesh, producing the rig needed to deform that surface during animation. It can
+rig an arbitrary input mesh without Trellis2, Kimodo, or another model runtime.
+
 The source repository is the authoritative description of supported inputs,
 parity status, runtime behavior, and known limitations. The original model card
 remains authoritative for intended use, training data, research claims, and
@@ -39,6 +43,23 @@ runtime checks their embedded source identities at load time.
 
 F16 is the normal distribution. F32 is retained as the numerical reference
 bundle used for CPU/Vulkan parity work.
+
+## Download and use
+
+```sh
+hf download LocalAI-io/SkinTokens-GGUF \
+  --include "F16/*" \
+  --local-dir models/SkinTokens-GGUF
+
+skintokens-cli rig \
+  models/SkinTokens-GGUF/F16 \
+  character.glb character-rigged.glb \
+  --device vulkan --postprocess
+```
+
+This standalone command generates both the skeleton and learned skin weights.
+An existing skeleton can instead be supplied through skin-tokens.cpp's binding
+workflow when a particular animation hierarchy must be retained.
 
 ## Provenance
 

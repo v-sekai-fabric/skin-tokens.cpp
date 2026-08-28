@@ -10,6 +10,9 @@ namespace {
 void usage() {
     std::cerr << "usage:\n"
               << "  skintokens-cli inspect MODEL_DIR [--device auto|cpu|vulkan]\n"
+              << "  skintokens-cli rig MODEL_DIR MESH.{glb,t2mesh} OUTPUT.glb"
+                 " [--device auto|cpu|vulkan] [--postprocess]"
+                 " [--beams N] [--temperature F] [--max-tokens N]\n"
               << "  skintokens-cli retarget-check SOMA30.glb [MIXAMO52.glb]\n"
               << "  skintokens-cli prepare-mixamo MESH.glb SOMA30.glb OUTPUT.glb\n"
               << "  skintokens-cli bind MODEL_DIR MESH.{glb,t2mesh} MOTION.glb OUTPUT.glb"
@@ -129,6 +132,30 @@ int main(int argc, char ** argv) {
     }
     if (std::string_view{argv[1]} == "inspect") {
         std::cout << "SkinTokens 0.1 model bundle\nbackend: " << model->backend_name() << '\n';
+        return 0;
+    }
+    if (std::string_view{argv[1]} == "rig") {
+        if (argc < 5) { usage(); return 2; }
+        const std::filesystem::path mesh_path = argv[3];
+        auto geometry = mesh_path.extension() == ".t2mesh" ?
+            skintokens::load_trellis_mesh_file(mesh_path) : skintokens::load_glb_file(mesh_path);
+        if (!geometry) { std::cerr << geometry.error().message << '\n'; return 1; }
+        auto binding = model->rig(*geometry, generation);
+        if (!binding) { std::cerr << binding.error().message << '\n'; return 1; }
+
+        // A rigged static GLB still needs one identity pose so ordinary glTF
+        // viewers can evaluate the skin immediately. It can later receive
+        // animation from any compatible retargeting workflow.
+        skintokens::motion rest;
+        rest.frames = 1U;
+        rest.frames_per_second = 30.0F;
+        rest.rig = binding->rig;
+        rest.root_translations.assign(1U, {});
+        rest.local_rotations.assign(rest.rig.names.size(), {});
+        auto saved = skintokens::save_skinned_animation_glb_file(
+            argv[4], *geometry, *binding, rest);
+        if (!saved) { std::cerr << saved.error().message << '\n'; return 1; }
+        std::cout << "learned skeleton and skin weights written to " << argv[4] << '\n';
         return 0;
     }
     if (std::string_view{argv[1]} != "bind" || argc < 6) {
