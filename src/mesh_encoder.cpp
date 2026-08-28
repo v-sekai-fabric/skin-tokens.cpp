@@ -23,22 +23,27 @@ ggml_tensor * linear(ggml_context * context, ggml_tensor * input, const weight_c
                      const std::string & stem, bool bias = true) {
     auto * output = ggml_mul_mat(context, need(weights, stem + ".w"), input);
     ggml_mul_mat_set_prec(output, GGML_PREC_F32);
-    if (bias) output = ggml_add(context, output, ggml_repeat(context, need(weights, stem + ".b"), output));
+    if (bias) {
+        auto * value = need(weights, stem + ".b");
+        if (value->type != output->type) value = ggml_cast(context, value, output->type);
+        output = ggml_add(context, output, ggml_repeat(context, value, output));
+    }
     return output;
 }
 
 ggml_tensor * norm(ggml_context * context, ggml_tensor * input, const weight_component & weights,
                    const std::string & stem) {
     auto * value = ggml_norm(context, input, 1e-5F);
-    value = ggml_mul(context, value, ggml_repeat(context, need(weights, stem + ".w"), value));
-    return ggml_add(context, value, ggml_repeat(context, need(weights, stem + ".b"), value));
+    auto * scale = need(weights, stem + ".w");
+    auto * bias = need(weights, stem + ".b");
+    if (scale->type != value->type) scale = ggml_cast(context, scale, value->type);
+    if (bias->type != value->type) bias = ggml_cast(context, bias, value->type);
+    value = ggml_mul(context, value, ggml_repeat(context, scale, value));
+    return ggml_add(context, value, ggml_repeat(context, bias, value));
 }
 
 ggml_tensor * attention(ggml_context * context, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
-                        std::int64_t query_count, std::int64_t data_count) {
-    q = ggml_reshape_3d(context, ggml_cont(context, q), head_dim, heads, query_count);
-    k = ggml_reshape_3d(context, ggml_cont(context, k), head_dim, heads, data_count);
-    v = ggml_reshape_3d(context, ggml_cont(context, v), head_dim, heads, data_count);
+                        std::int64_t query_count) {
     q = ggml_permute(context, q, 0, 2, 1, 3);
     k = ggml_permute(context, k, 0, 2, 1, 3);
     v = ggml_permute(context, v, 0, 2, 1, 3);
@@ -96,9 +101,13 @@ result<tensor_snapshot> run_mesh_encoder_fixture(const weight_component & weight
     const std::string cross = "mesh.enc.xattn";
     auto * q = linear(context, norm(context, state, weights, cross + ".ln_1"), weights, cross + ".attn.c_q", false);
     auto * kv = linear(context, norm(context, projected, weights, cross + ".ln_2"), weights, cross + ".attn.c_kv", false);
-    auto * k = ggml_view_2d(context, kv, width, points_count, kv->nb[1], 0);
-    auto * v = ggml_view_2d(context, kv, width, points_count, kv->nb[1], static_cast<std::size_t>(width) * sizeof(float));
-    state = ggml_add(context, state, linear(context, attention(context, q, k, v, queries, points_count),
+    q = ggml_reshape_3d(context, q, head_dim, heads, queries);
+    auto * k = ggml_view_3d(context, kv, head_dim, heads, points_count,
+        static_cast<std::size_t>(2 * head_dim) * kv->nb[0], kv->nb[1], 0);
+    auto * v = ggml_view_3d(context, kv, head_dim, heads, points_count,
+        static_cast<std::size_t>(2 * head_dim) * kv->nb[0], kv->nb[1],
+        static_cast<std::size_t>(head_dim) * kv->nb[0]);
+    state = ggml_add(context, state, linear(context, attention(context, q, k, v, queries),
                                             weights, cross + ".attn.c_proj"));
     state = ggml_add(context, state, mlp(context, norm(context, state, weights, cross + ".ln_3"),
                                          weights, cross + ".mlp"));
@@ -107,10 +116,15 @@ result<tensor_snapshot> run_mesh_encoder_fixture(const weight_component & weight
         const std::string stem = "mesh.enc.attn.resblocks." + std::to_string(layer);
         auto * qkv = linear(context, norm(context, state, weights, stem + ".ln_1"),
                             weights, stem + ".attn.c_qkv", false);
-        q = ggml_view_2d(context, qkv, width, queries, qkv->nb[1], 0);
-        k = ggml_view_2d(context, qkv, width, queries, qkv->nb[1], static_cast<std::size_t>(width) * sizeof(float));
-        v = ggml_view_2d(context, qkv, width, queries, qkv->nb[1], static_cast<std::size_t>(2 * width) * sizeof(float));
-        state = ggml_add(context, state, linear(context, attention(context, q, k, v, queries, queries),
+        q = ggml_view_3d(context, qkv, head_dim, heads, queries,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1], 0);
+        k = ggml_view_3d(context, qkv, head_dim, heads, queries,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1],
+            static_cast<std::size_t>(head_dim) * qkv->nb[0]);
+        v = ggml_view_3d(context, qkv, head_dim, heads, queries,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1],
+            static_cast<std::size_t>(2 * head_dim) * qkv->nb[0]);
+        state = ggml_add(context, state, linear(context, attention(context, q, k, v, queries),
                                                 weights, stem + ".attn.c_proj"));
         state = ggml_add(context, state, mlp(context, norm(context, state, weights, stem + ".ln_2"),
                                              weights, stem + ".mlp"));
@@ -120,8 +134,10 @@ result<tensor_snapshot> run_mesh_encoder_fixture(const weight_component & weight
     state = norm(context, state, weights, "mesh.enc.ln_post");
     snapshots.emplace_back("ln_post", state);
     state = linear(context, state, weights, "mesh.out.0");
+    auto * output_scale = need(weights, "mesh.out.1.w");
+    if (output_scale->type != state->type) output_scale = ggml_cast(context, output_scale, state->type);
     state = ggml_mul(context, ggml_rms_norm(context, state, std::numeric_limits<float>::epsilon()),
-                     ggml_repeat(context, need(weights, "mesh.out.1.w"), state));
+                     ggml_repeat(context, output_scale, state));
     snapshots.emplace_back("output", state);
     for (const auto & [name, tensor] : snapshots) { (void) name; ggml_set_output(tensor); }
     auto * graph = ggml_new_graph_custom(context, 8192, false);
@@ -178,25 +194,36 @@ result<std::vector<float>> encode_mesh(const weight_component & weights, ggml_ba
     const std::string cross = "mesh.enc.xattn";
     auto * q = linear(context, norm(context, state, weights, cross + ".ln_1"), weights, cross + ".attn.c_q", false);
     auto * kv = linear(context, norm(context, projected, weights, cross + ".ln_2"), weights, cross + ".attn.c_kv", false);
-    auto * k = ggml_view_2d(context, kv, width, data_count, kv->nb[1], 0);
-    auto * v = ggml_view_2d(context, kv, width, data_count, kv->nb[1], static_cast<std::size_t>(width) * sizeof(float));
-    state = ggml_add(context, state, linear(context, attention(context, q, k, v, query_count, data_count),
+    q = ggml_reshape_3d(context, q, head_dim, heads, query_count);
+    auto * k = ggml_view_3d(context, kv, head_dim, heads, data_count,
+        static_cast<std::size_t>(2 * head_dim) * kv->nb[0], kv->nb[1], 0);
+    auto * v = ggml_view_3d(context, kv, head_dim, heads, data_count,
+        static_cast<std::size_t>(2 * head_dim) * kv->nb[0], kv->nb[1],
+        static_cast<std::size_t>(head_dim) * kv->nb[0]);
+    state = ggml_add(context, state, linear(context, attention(context, q, k, v, query_count),
                                             weights, cross + ".attn.c_proj"));
     state = ggml_add(context, state, mlp(context, norm(context, state, weights, cross + ".ln_3"), weights, cross + ".mlp"));
     for (std::size_t layer = 0; layer < 8U; ++layer) {
         const std::string stem = "mesh.enc.attn.resblocks." + std::to_string(layer);
         auto * qkv = linear(context, norm(context, state, weights, stem + ".ln_1"), weights, stem + ".attn.c_qkv", false);
-        q = ggml_view_2d(context, qkv, width, query_count, qkv->nb[1], 0);
-        k = ggml_view_2d(context, qkv, width, query_count, qkv->nb[1], static_cast<std::size_t>(width) * sizeof(float));
-        v = ggml_view_2d(context, qkv, width, query_count, qkv->nb[1], static_cast<std::size_t>(2 * width) * sizeof(float));
-        state = ggml_add(context, state, linear(context, attention(context, q, k, v, query_count, query_count),
+        q = ggml_view_3d(context, qkv, head_dim, heads, query_count,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1], 0);
+        k = ggml_view_3d(context, qkv, head_dim, heads, query_count,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1],
+            static_cast<std::size_t>(head_dim) * qkv->nb[0]);
+        v = ggml_view_3d(context, qkv, head_dim, heads, query_count,
+            static_cast<std::size_t>(3 * head_dim) * qkv->nb[0], qkv->nb[1],
+            static_cast<std::size_t>(2 * head_dim) * qkv->nb[0]);
+        state = ggml_add(context, state, linear(context, attention(context, q, k, v, query_count),
                                                 weights, stem + ".attn.c_proj"));
         state = ggml_add(context, state, mlp(context, norm(context, state, weights, stem + ".ln_2"), weights, stem + ".mlp"));
     }
     state = norm(context, state, weights, "mesh.enc.ln_post");
     state = linear(context, state, weights, "mesh.out.0");
+    auto * output_scale = need(weights, "mesh.out.1.w");
+    if (output_scale->type != state->type) output_scale = ggml_cast(context, output_scale, state->type);
     state = ggml_mul(context, ggml_rms_norm(context, state, std::numeric_limits<float>::epsilon()),
-                     ggml_repeat(context, need(weights, "mesh.out.1.w"), state));
+                     ggml_repeat(context, output_scale, state));
     auto * graph = ggml_new_graph_custom(context, 16384, false);
     ggml_build_forward_expand(graph, state);
     auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));

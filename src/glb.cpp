@@ -682,31 +682,73 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
         animations == doc->root.end() || !animations->is_array() || animations->empty())
         return std::unexpected(detail::fail(error_code::invalid_format, "GLB has no bounded skeleton animation"));
     motion output;
-    const std::size_t joint_count = nodes->size();
+    std::vector<std::size_t> joint_nodes;
+    const auto skins = doc->root.find("skins");
+    if (skins != doc->root.end() && skins->is_array() && !skins->empty() &&
+        (*skins)[0].contains("joints") && (*skins)[0]["joints"].is_array()) {
+        for (const auto & value : (*skins)[0]["joints"]) {
+            if (!value.is_number_unsigned() || value.get<std::size_t>() >= nodes->size())
+                return std::unexpected(detail::fail(error_code::invalid_format, "skin joint node is invalid"));
+            joint_nodes.push_back(value.get<std::size_t>());
+        }
+    } else {
+        joint_nodes.resize(nodes->size());
+        std::iota(joint_nodes.begin(), joint_nodes.end(), 0U);
+    }
+    if (joint_nodes.empty() || joint_nodes.size() > 256U)
+        return std::unexpected(detail::fail(error_code::limit_exceeded, "GLB has no bounded skin joints"));
+    std::vector<std::int32_t> node_to_joint(nodes->size(), -1);
+    for (std::size_t joint = 0; joint < joint_nodes.size(); ++joint) {
+        if (node_to_joint[joint_nodes[joint]] >= 0)
+            return std::unexpected(detail::fail(error_code::invalid_format, "skin contains duplicate joints"));
+        node_to_joint[joint_nodes[joint]] = static_cast<std::int32_t>(joint);
+    }
+    const std::size_t joint_count = joint_nodes.size();
     output.rig.names.resize(joint_count);
     output.rig.parents.assign(joint_count, -1);
     output.rig.rest_positions.resize(joint_count);
-    for (std::size_t i = 0; i < joint_count; ++i) {
+    std::vector<std::int32_t> node_parents(nodes->size(), -1);
+    for (std::size_t i = 0; i < nodes->size(); ++i) {
         const auto & node = (*nodes)[i];
-        output.rig.names[i] = node.value("name", "joint_" + std::to_string(i));
         auto children = node.find("children");
         if (children != node.end() && children->is_array()) {
             for (const auto & child_value : *children) {
-                if (!child_value.is_number_unsigned() || child_value.get<std::size_t>() >= joint_count)
+                if (!child_value.is_number_unsigned() || child_value.get<std::size_t>() >= nodes->size())
                     return std::unexpected(detail::fail(error_code::invalid_format, "skeleton child index is invalid"));
                 const auto child = child_value.get<std::size_t>();
-                if (output.rig.parents[child] >= 0)
+                if (node_parents[child] >= 0)
                     return std::unexpected(detail::fail(error_code::invalid_format, "skeleton node has multiple parents"));
-                output.rig.parents[child] = static_cast<std::int32_t>(i);
+                node_parents[child] = static_cast<std::int32_t>(i);
             }
         }
     }
-    // Kimodo's node translations are local; parents precede children in its
-    // exporter, so accumulate the bind positions after parent discovery.
-    for (std::size_t i = 0; i < joint_count; ++i) {
-        const vec3 local = node_translation((*nodes)[i]);
-        output.rig.rest_positions[i] = output.rig.parents[i] < 0 ? local :
-            add(output.rig.rest_positions[static_cast<std::size_t>(output.rig.parents[i])], local);
+    std::vector<vec3> node_positions(nodes->size());
+    std::vector<std::uint8_t> position_state(nodes->size());
+    std::function<result<vec3>(std::size_t)> global_position = [&](std::size_t node) -> result<vec3> {
+        if (position_state[node] == 2U) return node_positions[node];
+        if (position_state[node] == 1U)
+            return std::unexpected(detail::fail(error_code::invalid_format, "skeleton hierarchy contains a cycle"));
+        position_state[node] = 1U;
+        const vec3 local = node_translation((*nodes)[node]);
+        if (node_parents[node] < 0) node_positions[node] = local;
+        else {
+            auto parent = global_position(static_cast<std::size_t>(node_parents[node]));
+            if (!parent) return std::unexpected(parent.error());
+            node_positions[node] = add(*parent, local);
+        }
+        position_state[node] = 2U;
+        return node_positions[node];
+    };
+    for (std::size_t joint = 0; joint < joint_count; ++joint) {
+        const std::size_t node_index = joint_nodes[joint];
+        output.rig.names[joint] = (*nodes)[node_index].value("name", "joint_" + std::to_string(joint));
+        std::int32_t parent_node = node_parents[node_index];
+        while (parent_node >= 0 && node_to_joint[static_cast<std::size_t>(parent_node)] < 0)
+            parent_node = node_parents[static_cast<std::size_t>(parent_node)];
+        output.rig.parents[joint] = parent_node < 0 ? -1 : node_to_joint[static_cast<std::size_t>(parent_node)];
+        auto position = global_position(node_index);
+        if (!position) return std::unexpected(position.error());
+        output.rig.rest_positions[joint] = *position;
     }
     const auto & animation = (*animations)[0];
     auto samplers = animation.find("samplers");
@@ -727,14 +769,16 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
         auto values = get_accessor(*doc, sampler["output"].get<std::size_t>());
         if (!times) return std::unexpected(times.error());
         if (!values) return std::unexpected(values.error());
-        if (times->count != values->count || target["node"].get<std::size_t>() >= joint_count) continue;
+        if (times->count != values->count || target["node"].get<std::size_t>() >= nodes->size()) continue;
+        const auto joint = node_to_joint[target["node"].get<std::size_t>()];
+        if (joint < 0) continue;
         frames = std::max(frames, times->count);
         if (times->count) {
             auto last = scalar(*times, times->count - 1U);
             if (!last) return std::unexpected(last.error());
             duration = std::max(duration, *last);
         }
-        parsed.push_back({target["node"].get<std::size_t>(), target["path"].get<std::string>(), *times, *values});
+        parsed.push_back({static_cast<std::size_t>(joint), target["path"].get<std::string>(), *times, *values});
     }
     if (frames == 0U || frames > 100000U)
         return std::unexpected(detail::fail(error_code::invalid_format, "animation has no bounded keyframes"));

@@ -35,4 +35,27 @@ int main() {
                                                 4.0F/18.0F, 3.0F/18.0F};
     for (std::size_t slot = 0; slot < 4U; ++slot)
         assert(std::abs(binding.weights[0][slot] - expected_weights[slot]) < 1.0e-6F);
+
+    // The end-to-end upstream demo postprocess must keep the learned values
+    // but prevent a remote high sigmoid channel from binding this vertex.
+    // Build one connected strip and place joint zero at the queried end while
+    // the raw learned ranking still favours distant joint five.
+    const std::array<skintokens::vec3, 6> surface{{
+        {0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {2.0F, 0.0F, 0.0F},
+        {3.0F, 0.0F, 0.0F}, {4.0F, 0.0F, 0.0F}, {5.0F, 0.0F, 0.0F},
+    }};
+    const std::array<skintokens::triangle, 4> faces{{
+        {{0U, 1U, 2U}}, {{1U, 2U, 3U}}, {{2U, 3U, 4U}}, {{3U, 4U, 5U}},
+    }};
+    std::array<skintokens::vec3, 6> normalized_joints{};
+    for (std::size_t joint = 0; joint < normalized_joints.size(); ++joint)
+        normalized_joints[joint] = surface[joint];
+    std::array<std::vector<float>, 6> learned;
+    for (std::size_t joint = 0; joint < learned.size(); ++joint)
+        learned[joint].assign(sampled.size(), 0.1F * static_cast<float>(joint + 1U));
+    const auto corrected = skintokens::detail::integrate_postprocessed_binding(
+        rig, surface, faces,
+        normalized_joints, sampled, learned);
+    assert(corrected.joints[0][0] == 0U);
+    assert(corrected.weights[0][0] > 0.999F);
 }

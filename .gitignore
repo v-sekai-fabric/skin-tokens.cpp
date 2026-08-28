@@ -17,6 +17,7 @@
 !/models/MANIFEST.md
 /fixtures/
 /demo-data/
+/demo/demo-data/
 /reference/upstream/
 *.ckpt
 *.gguf

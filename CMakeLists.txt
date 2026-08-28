@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 project(skin-tokens.cpp VERSION 0.1.0 LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +16,9 @@ option(SKINTOKENS_CPU_ALL_VARIANTS "Build portable CPU backend variants" ON)
 option(SKINTOKENS_SANITIZE "Enable ASan and UBSan" OFF)
 option(SKINTOKENS_FUZZ "Build parser fuzzers" OFF)
 set(SKINTOKENS_GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml" CACHE PATH "Pinned GGML submodule")
+set(SKINTOKENS_PARITY_MODEL_DIR "" CACHE PATH "GGUF bundle for opt-in full binding parity tests")
+set(SKINTOKENS_PARITY_FIXTURE_DIR "" CACHE PATH "Captured final upstream binding fixture")
+set(SKINTOKENS_GIRAFFE_FIXTURE_DIR "" CACHE PATH "Captured official upstream giraffe fixture")
 
 if(SKINTOKENS_SANITIZE)
   if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -38,6 +43,23 @@ if(SKINTOKENS_DYNAMIC_BACKENDS)
 endif()
 add_subdirectory("${SKINTOKENS_GGML_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
 
+# GGML records its public headers as paths relative to the submodule root.
+# This parent project owns the install rule (the subdirectory is excluded from
+# the default install), so make those paths absolute before CMake evaluates
+# them from this directory.
+get_target_property(SKINTOKENS_GGML_PUBLIC_HEADERS ggml PUBLIC_HEADER)
+set(SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE)
+foreach(header IN LISTS SKINTOKENS_GGML_PUBLIC_HEADERS)
+  if(IS_ABSOLUTE "${header}")
+    list(APPEND SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE "${header}")
+  else()
+    list(APPEND SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE
+      "${SKINTOKENS_GGML_SOURCE_DIR}/${header}")
+  endif()
+endforeach()
+set_target_properties(ggml PROPERTIES
+  PUBLIC_HEADER "${SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE}")
+
 find_package(Threads REQUIRED)
 find_package(nlohmann_json 3.11 REQUIRED)
 
@@ -50,6 +72,7 @@ add_library(skintokens SHARED
   src/mesh_encoder.cpp
   src/model.cpp
   src/qwen.cpp
+  src/retarget.cpp
   src/skinning.cpp
   src/skin_vae.cpp
   src/tokenizer.cpp
@@ -63,7 +86,11 @@ target_link_libraries(skintokens PRIVATE ggml Threads::Threads nlohmann_json::nl
 if(TARGET skintokens_sanitizers)
   target_link_libraries(skintokens PUBLIC skintokens_sanitizers)
 endif()
-set_target_properties(skintokens PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+set_target_properties(skintokens PROPERTIES
+  VERSION ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES)
 if(MSVC)
   target_compile_options(skintokens PRIVATE /W4 /permissive- /sdl)
 else()
@@ -73,6 +100,37 @@ endif()
 add_executable(skintokens-cli src/cli.cpp)
 target_link_libraries(skintokens-cli PRIVATE skintokens::skintokens)
 set_target_properties(skintokens-cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+install(TARGETS skintokens skintokens-cli
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/skintokens DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# add_subdirectory(... EXCLUDE_FROM_ALL) keeps GGML's own install rules out of
+# this project. Ship the core runtime and dynamic backends explicitly so a
+# normal skin-tokens.cpp install does not depend on its build tree.
+install(TARGETS ggml ggml-base
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+foreach(backend IN LISTS GGML_AVAILABLE_BACKENDS)
+  if(TARGET ${backend})
+    install(TARGETS ${backend}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+      LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+    if(UNIX AND NOT APPLE)
+      set_property(TARGET ${backend} PROPERTY INSTALL_RPATH
+        "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+    endif()
+  endif()
+endforeach()
+if(UNIX AND NOT APPLE)
+  set_property(TARGET ggml ggml-base skintokens PROPERTY INSTALL_RPATH "$ORIGIN")
+  set_property(TARGET skintokens-cli PROPERTY INSTALL_RPATH
+    "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
 
 add_executable(skintokens-qwen-parity
   tools/qwen_parity.cpp src/backend.cpp src/qwen.cpp src/weights.cpp)
@@ -103,10 +161,16 @@ target_link_libraries(skintokens-animation-parity PRIVATE skintokens::skintokens
 set_target_properties(skintokens-animation-parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 add_executable(skintokens-full-binding-parity
-  tools/full_binding_parity.cpp src/backend.cpp src/binding.cpp src/skin_vae.cpp src/weights.cpp)
+  tools/full_binding_parity.cpp src/backend.cpp src/binding.cpp src/skinning.cpp src/skin_vae.cpp src/weights.cpp)
 target_include_directories(skintokens-full-binding-parity PRIVATE src include)
 target_link_libraries(skintokens-full-binding-parity PRIVATE ggml Threads::Threads nlohmann_json::nlohmann_json)
 set_target_properties(skintokens-full-binding-parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(skintokens-giraffe-parity
+  tools/giraffe_parity.cpp src/backend.cpp src/binding.cpp src/skin_vae.cpp src/weights.cpp)
+target_include_directories(skintokens-giraffe-parity PRIVATE src include)
+target_link_libraries(skintokens-giraffe-parity PRIVATE ggml Threads::Threads nlohmann_json::nlohmann_json)
+set_target_properties(skintokens-giraffe-parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 add_executable(skintokens-logits-dump
   tools/logits_dump.cpp src/backend.cpp src/qwen.cpp src/weights.cpp)
@@ -117,6 +181,34 @@ set_target_properties(skintokens-logits-dump PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 include(CTest)
 if(SKINTOKENS_BUILD_TESTS)
   add_subdirectory(tests)
+  if(SKINTOKENS_PARITY_MODEL_DIR AND SKINTOKENS_PARITY_FIXTURE_DIR)
+    add_test(NAME skintokens-final-binding-parity-cpu COMMAND
+      skintokens-full-binding-parity
+      "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_PARITY_FIXTURE_DIR}" cpu)
+    set_tests_properties(skintokens-final-binding-parity-cpu PROPERTIES
+      LABELS "model;parity" TIMEOUT 900)
+    if(SKINTOKENS_ENABLE_VULKAN)
+      add_test(NAME skintokens-final-binding-parity-vulkan COMMAND
+        skintokens-full-binding-parity
+        "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_PARITY_FIXTURE_DIR}" vulkan)
+      set_tests_properties(skintokens-final-binding-parity-vulkan PROPERTIES
+        LABELS "model;parity;gpu" TIMEOUT 900)
+    endif()
+  endif()
+  if(SKINTOKENS_PARITY_MODEL_DIR AND SKINTOKENS_GIRAFFE_FIXTURE_DIR)
+    add_test(NAME skintokens-giraffe-parity-cpu COMMAND
+      skintokens-giraffe-parity
+      "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_GIRAFFE_FIXTURE_DIR}" cpu)
+    set_tests_properties(skintokens-giraffe-parity-cpu PROPERTIES
+      LABELS "model;parity;official-example" TIMEOUT 1800)
+    if(SKINTOKENS_ENABLE_VULKAN)
+      add_test(NAME skintokens-giraffe-parity-vulkan COMMAND
+        skintokens-giraffe-parity
+        "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_GIRAFFE_FIXTURE_DIR}" vulkan)
+      set_tests_properties(skintokens-giraffe-parity-vulkan PROPERTIES
+        LABELS "model;parity;official-example;gpu" TIMEOUT 1800)
+    endif()
+  endif()
 endif()
 if(SKINTOKENS_FUZZ)
   add_subdirectory(fuzz)

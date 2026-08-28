@@ -141,58 +141,250 @@ std::vector<std::int32_t> farthest_points(std::span<const vec3> points, std::siz
     return output;
 }
 
-struct sampled_cloud { std::vector<vec3> points; std::vector<vec3> normals; };
+struct sampled_cloud {
+    std::vector<vec3> points;
+    std::vector<vec3> normals;
+    std::vector<std::uint32_t> faces;
+    std::vector<std::array<double, 2>> barycentric;
+};
+
+// NumPy's legacy RandomState is used by the released preprocessing path.  It
+// is not interchangeable with the C++ standard distributions: in particular,
+// sample_surface draws every face first and only then draws all barycentric
+// coordinates.  Keeping this tiny compatible lane also makes captured seeds
+// meaningful across the Python and C++ implementations.
+class numpy_random_state {
+public:
+    explicit numpy_random_state(std::uint32_t seed) : engine_(seed) {}
+
+    double random_double() {
+        const std::uint64_t a = static_cast<std::uint64_t>(engine_() >> 5U);
+        const std::uint64_t b = static_cast<std::uint64_t>(engine_() >> 6U);
+        return static_cast<double>(a * 67'108'864ULL + b) / 9'007'199'254'740'992.0;
+    }
+
+    void consume_permutation(std::size_t count) {
+        if (count < 2U) return;
+        for (std::size_t i = count - 1U; i != 0U; --i) (void) interval(i);
+    }
+
+private:
+    std::size_t interval(std::size_t maximum) {
+        std::uint32_t mask = static_cast<std::uint32_t>(maximum);
+        mask |= mask >> 1U; mask |= mask >> 2U; mask |= mask >> 4U;
+        mask |= mask >> 8U; mask |= mask >> 16U;
+        std::uint32_t value;
+        do value = static_cast<std::uint32_t>(engine_()) & mask; while (value > maximum);
+        return value;
+    }
+
+    std::mt19937 engine_;
+};
+
+// NumPy 1.26 default_rng(0/1), used by both released farthest-point sampling
+// paths.  PCG64 and Generator.choice follow NumPy's MIT/BSD-licensed reference
+// algorithms; see NOTICE.  Only the two fixed inference seeds are accepted so
+// the SeedSequence implementation does not become part of the runtime.
+class numpy_pcg64 {
+public:
+    explicit numpy_pcg64(std::uint64_t seed) {
+        if (seed == 0U) {
+            state_ = make128(0x1aa1b5345996452dULL, 0x09585eb7a69561e3ULL);
+            increment_ = make128(0x418ddadb3af71a82ULL, 0x588133bc447873a9ULL);
+        } else if (seed == 1U) {
+            state_ = make128(0x9c5b484bfedb756cULL, 0x2a6e7d6f320fbc7eULL);
+            increment_ = make128(0x922af2da2645f895ULL, 0xa19857b95740937bULL);
+        } else throw std::invalid_argument("unsupported fixed NumPy PCG64 seed");
+    }
+
+    std::vector<std::size_t> choice(std::size_t population, std::size_t count) {
+        if (count > population) throw std::invalid_argument("NumPy choice exceeds population");
+        std::vector<std::size_t> values(population);
+        std::iota(values.begin(), values.end(), 0U);
+        const std::size_t first = std::max(population - count, std::size_t{1});
+        for (std::size_t i = population - 1U;; --i) {
+            const std::size_t selected = bounded(i);
+            std::swap(values[selected], values[i]);
+            if (i == first) break;
+        }
+        return {values.end() - static_cast<std::ptrdiff_t>(count), values.end()};
+    }
+
+private:
+#if defined(__SIZEOF_INT128__)
+    __extension__ using uint128 = unsigned __int128;
+#else
+#error "The NumPy-compatible PCG64 inference sampler requires 128-bit integer support"
+#endif
+
+    static constexpr uint128 make128(std::uint64_t high, std::uint64_t low) {
+        return (static_cast<uint128>(high) << 64U) | static_cast<uint128>(low);
+    }
+
+    std::uint64_t next64() {
+        constexpr uint128 multiplier = make128(0x2360ed051fc65da4ULL, 0x4385df649fccf645ULL);
+        state_ = state_ * multiplier + increment_;
+        const auto high = static_cast<std::uint64_t>(state_ >> 64U);
+        const auto low = static_cast<std::uint64_t>(state_);
+        const auto value = high ^ low;
+        const auto rotation = static_cast<unsigned>(high >> 58U);
+        return (value >> rotation) | (value << ((0U - rotation) & 63U));
+    }
+
+    std::uint32_t next32() {
+        if (has_uint32_) { has_uint32_ = false; return buffered_uint32_; }
+        const auto value = next64();
+        buffered_uint32_ = static_cast<std::uint32_t>(value >> 32U);
+        has_uint32_ = true;
+        return static_cast<std::uint32_t>(value);
+    }
+
+    std::size_t bounded(std::size_t inclusive_maximum) {
+        const auto range = static_cast<std::uint32_t>(inclusive_maximum + 1U);
+        std::uint64_t product = static_cast<std::uint64_t>(next32()) * range;
+        std::uint32_t leftover = static_cast<std::uint32_t>(product);
+        if (leftover < range) {
+            const std::uint32_t threshold = static_cast<std::uint32_t>(0U - range) % range;
+            while (leftover < threshold) {
+                product = static_cast<std::uint64_t>(next32()) * range;
+                leftover = static_cast<std::uint32_t>(product);
+            }
+        }
+        return static_cast<std::size_t>(product >> 32U);
+    }
+
+    uint128 state_ = 0;
+    uint128 increment_ = 0;
+    bool has_uint32_ = false;
+    std::uint32_t buffered_uint32_ = 0;
+};
+
+result<std::optional<std::vector<std::int32_t>>> forced_skin_codes(
+    std::size_t joint_count) {
+    const char * path = std::getenv("SKINTOKENS_FORCED_CODES");
+    if (path == nullptr || *path == '\0') return std::optional<std::vector<std::int32_t>>{};
+    const std::size_t expected = joint_count * 4U;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input)
+        return std::unexpected(detail::fail(error_code::io,
+            "cannot open forced SkinVAE codes: " + std::string{path}));
+    const auto bytes = input.tellg();
+    if (bytes < 0 || static_cast<std::uint64_t>(bytes) != expected * sizeof(std::int32_t))
+        return std::unexpected(detail::fail(error_code::invalid_argument,
+            "forced SkinVAE code file must contain exactly four int32 values per joint"));
+    input.seekg(0);
+    std::vector<std::int32_t> codes(expected);
+    input.read(reinterpret_cast<char *>(codes.data()), static_cast<std::streamsize>(expected * sizeof(std::int32_t)));
+    if (!input)
+        return std::unexpected(detail::fail(error_code::io, "cannot read forced SkinVAE codes"));
+    for (const auto code : codes) {
+        if (code < 0 || code > 32768)
+            return std::unexpected(detail::fail(error_code::invalid_argument,
+                "forced SkinVAE code is outside the checkpoint vocabulary"));
+    }
+    return std::optional<std::vector<std::int32_t>>{std::move(codes)};
+}
 
 result<sampled_cloud> sample_mesh_surface(const mesh & source, std::span<const vec3> normalized,
-                                          std::span<const vec3> vertex_normal, std::uint64_t seed) {
+                                          std::span<const vec3> vertex_normal, std::uint64_t seed,
+                                          std::span<const std::array<double, 3>> precise = {}) {
     constexpr std::size_t total_samples = 54000U;
     // The released predict config declares 16,384 vertex samples, but
     // SamplerMix.sample() does not forward that member to
     // sample_vertex_groups(). Match the executable upstream path: all 54K
     // samples are area-weighted surface points.
     constexpr std::size_t vertex_samples = 0U;
+    (void) vertex_normal;
+    if (!precise.empty() && precise.size() != normalized.size())
+        return std::unexpected(detail::fail(error_code::invalid_argument,
+            "precise normalized positions must match the mesh"));
+    const auto coordinate = [&](std::size_t vertex, std::size_t axis) {
+        if (!precise.empty()) return precise[vertex][axis];
+        const auto value = normalized[vertex];
+        return static_cast<double>(axis == 0U ? value.x : axis == 1U ? value.y : value.z);
+    };
+    const auto blender_face = [](triangle face) {
+        // BpyParser rebuilds each triangle from polygon.edge_keys, then picks
+        // list(set(sorted(nodes)))[0] as its first corner.  For three small
+        // non-negative integer keys, this is CPython's eight-slot small-set
+        // insertion/iteration order.  Preserve winding and reproduce only the
+        // resulting cyclic rotation.
+        std::array<std::uint32_t, 3> sorted{face[0], face[1], face[2]};
+        std::sort(sorted.begin(), sorted.end());
+        std::array<std::optional<std::uint32_t>, 8> table{};
+        for (const auto key : sorted) {
+            std::uint64_t perturb = key;
+            std::size_t slot = static_cast<std::size_t>(key & 7U);
+            while (table[slot] && *table[slot] != key) {
+                perturb >>= 5U;
+                slot = (slot * 5U + 1U + static_cast<std::size_t>(perturb)) & 7U;
+            }
+            table[slot] = key;
+        }
+        const auto first = **std::find_if(table.begin(), table.end(), [](const auto & value) { return value.has_value(); });
+        while (face[0] != first) std::rotate(face.begin(), face.begin() + 1, face.end());
+        return face;
+    };
     sampled_cloud output;
     output.points.reserve(total_samples); output.normals.reserve(total_samples);
-    std::mt19937_64 random{seed};
-    std::vector<std::size_t> order(normalized.size());
-    std::iota(order.begin(), order.end(), 0U);
-    std::shuffle(order.begin(), order.end(), random);
-    const std::size_t direct = std::min(vertex_samples, order.size());
-    for (std::size_t i = 0; i < direct; ++i) {
-        output.points.push_back(normalized[order[i]]);
-        output.normals.push_back(vertex_normal[order[i]]);
-    }
+    if (seed > std::numeric_limits<std::uint32_t>::max())
+        return std::unexpected(detail::fail(error_code::invalid_argument,
+            "sampling seed exceeds NumPy RandomState's supported range"));
+    numpy_random_state random{static_cast<std::uint32_t>(seed)};
+    // AugmentAffine consumes these two draws even though both inference-time
+    // probabilities are zero, then sample_vertex_groups constructs a complete
+    // permutation before selecting its configured zero direct vertices.
+    (void) random.random_double();
+    (void) random.random_double();
+    random.consume_permutation(normalized.size());
+    (void) vertex_samples;
     std::vector<double> areas(source.faces.size());
     std::vector<vec3> face_normals(source.faces.size());
     for (std::size_t i = 0; i < source.faces.size(); ++i) {
-        const auto & face = source.faces[i];
-        const vec3 left{normalized[face[1]].x - normalized[face[0]].x,
-                        normalized[face[1]].y - normalized[face[0]].y,
-                        normalized[face[1]].z - normalized[face[0]].z};
-        const vec3 right{normalized[face[2]].x - normalized[face[0]].x,
-                         normalized[face[2]].y - normalized[face[0]].y,
-                         normalized[face[2]].z - normalized[face[0]].z};
-        const vec3 value{left.y*right.z - left.z*right.y,
-                         left.z*right.x - left.x*right.z,
-                         left.x*right.y - left.y*right.x};
-        const float length = std::sqrt(value.x*value.x + value.y*value.y + value.z*value.z);
+        const auto face = blender_face(source.faces[i]);
+        const std::array<double, 3> left{
+            coordinate(face[1], 0U) - coordinate(face[0], 0U),
+            coordinate(face[1], 1U) - coordinate(face[0], 1U),
+            coordinate(face[1], 2U) - coordinate(face[0], 2U)};
+        const std::array<double, 3> right{
+            coordinate(face[2], 0U) - coordinate(face[0], 0U),
+            coordinate(face[2], 1U) - coordinate(face[0], 1U),
+            coordinate(face[2], 2U) - coordinate(face[0], 2U)};
+        const std::array<double, 3> value{
+            left[1]*right[2] - left[2]*right[1],
+            left[2]*right[0] - left[0]*right[2],
+            left[0]*right[1] - left[1]*right[0]};
+        const double length = std::sqrt(value[0]*value[0] + value[1]*value[1] + value[2]*value[2]);
         areas[i] = length;
-        face_normals[i] = length > 1e-12F ? vec3{value.x/length, value.y/length, value.z/length} :
-                                             vec3{0.0F, 1.0F, 0.0F};
+        face_normals[i] = length > 1e-12 ? vec3{
+            static_cast<float>(value[0]/length), static_cast<float>(value[1]/length),
+            static_cast<float>(value[2]/length)} : vec3{0.0F, 1.0F, 0.0F};
     }
-    if (std::accumulate(areas.begin(), areas.end(), 0.0) <= 0.0)
+    std::partial_sum(areas.begin(), areas.end(), areas.begin());
+    if (areas.back() <= 0.0)
         return std::unexpected(detail::fail(error_code::invalid_argument, "mesh has no non-degenerate surface"));
-    std::discrete_distribution<std::size_t> face_distribution(areas.begin(), areas.end());
-    std::uniform_real_distribution<float> unit(0.0F, 1.0F);
-    while (output.points.size() < total_samples) {
-        const std::size_t face_index = face_distribution(random);
-        const auto & face = source.faces[face_index];
-        float u = unit(random), v = unit(random);
-        if (u + v > 1.0F) { u = 1.0F - u; v = 1.0F - v; }
-        const auto a = normalized[face[0]], b = normalized[face[1]], c = normalized[face[2]];
-        output.points.push_back({a.x + (b.x-a.x)*u + (c.x-a.x)*v,
-                                 a.y + (b.y-a.y)*u + (c.y-a.y)*v,
-                                 a.z + (b.z-a.z)*u + (c.z-a.z)*v});
+    std::vector<std::size_t> face_indices(total_samples);
+    for (auto & face_index : face_indices) {
+        const double pick = random.random_double() * areas.back();
+        face_index = static_cast<std::size_t>(std::lower_bound(areas.begin(), areas.end(), pick) - areas.begin());
+    }
+    output.faces.reserve(total_samples);
+    output.barycentric.reserve(total_samples);
+    for (const auto face_index : face_indices) {
+        const auto face = blender_face(source.faces[face_index]);
+        double u = random.random_double(), v = random.random_double();
+        if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+        output.faces.push_back(static_cast<std::uint32_t>(face_index));
+        output.barycentric.push_back({u, v});
+        vec3 point{};
+        float * output_axes[]{&point.x, &point.y, &point.z};
+        for (std::size_t axis = 0; axis < 3U; ++axis) {
+            const double a = coordinate(face[0], axis);
+            const double b = coordinate(face[1], axis);
+            const double c = coordinate(face[2], axis);
+            *output_axes[axis] = static_cast<float>(a + (b-a)*u + (c-a)*v);
+        }
+        output.points.push_back(point);
         output.normals.push_back(face_normals[face_index]);
     }
     return output;
@@ -201,10 +393,8 @@ result<sampled_cloud> sample_mesh_surface(const mesh & source, std::span<const v
 std::vector<std::int32_t> sampled_farthest_points(std::span<const vec3> points,
                                                    std::size_t candidates, std::size_t wanted,
                                                    std::uint64_t seed) {
-    std::vector<std::size_t> order(points.size());
-    std::iota(order.begin(), order.end(), 0U);
-    std::mt19937_64 random{seed}; std::shuffle(order.begin(), order.end(), random);
-    order.resize(std::min(candidates, order.size()));
+    numpy_pcg64 random{seed};
+    auto order = random.choice(points.size(), std::min(candidates, points.size()));
     std::vector<vec3> subset; subset.reserve(order.size());
     for (const auto index : order) subset.push_back(points[index]);
     const auto local = farthest_points(subset, wanted);
@@ -258,7 +448,9 @@ void dump_binding_trace_if_requested(
     const std::vector<std::vector<float>> & dense, const skin & output,
     std::span<const vec3> normalized_vertices,
     std::span<const std::uint32_t> neighbor_indices,
-    std::span<const float> interpolation_weights) {
+    std::span<const float> interpolation_weights,
+    std::span<const float> surface_weights,
+    std::span<const float> final_dense_weights) {
     const char * prefix = std::getenv("SKINTOKENS_DUMP_BINDING_TRACE_PREFIX");
     if (prefix == nullptr || *prefix == '\0') return;
     const std::filesystem::path base{prefix};
@@ -279,6 +471,10 @@ void dump_binding_trace_if_requested(
     write(base.string() + ".normalized.f32", normalized_vertices.data(), normalized_vertices.size_bytes());
     write(base.string() + ".neighbors.u32", neighbor_indices.data(), neighbor_indices.size_bytes());
     write(base.string() + ".interpolation.f32", interpolation_weights.data(), interpolation_weights.size_bytes());
+    if (!surface_weights.empty())
+        write(base.string() + ".surface.f32", surface_weights.data(), surface_weights.size_bytes());
+    if (!final_dense_weights.empty())
+        write(base.string() + ".final-dense.f32", final_dense_weights.data(), final_dense_weights.size_bytes());
 }
 
 result<skin> decode_binding(const detail::weight_component & weights, ggml_backend_t backend,
@@ -287,7 +483,10 @@ result<skin> decode_binding(const detail::weight_component & weights, ggml_backe
                             std::span<const float> vae_condition,
                             std::span<const vec3> sampled_points,
                             std::span<const vec3> sampled_normals,
-                            std::span<const vec3> normalized_vertices) {
+                            std::span<const vec3> normalized_vertices,
+                            std::span<const triangle> faces,
+                            std::span<const vec3> normalized_joints,
+                            bool surface_postprocess) {
     if (codes.size() != target.names.size() * 4U)
         return std::unexpected(detail::fail(error_code::compute, "skin-code count does not match generated skeleton"));
     std::vector<std::vector<float>> dense(target.names.size());
@@ -298,18 +497,22 @@ result<skin> decode_binding(const detail::weight_component & weights, ggml_backe
         if (!decoded) return std::unexpected(decoded.error());
         dense[joint] = std::move(*decoded);
     }
-    // Match Asset.from_data(): the released runtime decodes on its 54K
-    // sampled cloud and interpolates each source vertex from eight nearest
-    // samples. The exporter keeps the greatest four learned influences.
+    // Decode on the 54K cloud and interpolate to source vertices. The normal
+    // upstream export retains those raw learned weights; voxel_skin is an
+    // explicit optional heuristic before top-four selection.
     const bool trace_binding = [] {
         const char * value = std::getenv("SKINTOKENS_DUMP_BINDING_TRACE_PREFIX");
         return value != nullptr && *value != '\0';
     }();
     detail::binding_trace trace;
-    auto output = detail::integrate_learned_binding(target, normalized_vertices,
-        sampled_points, dense, trace_binding ? &trace : nullptr);
+    auto output = surface_postprocess ?
+        detail::integrate_postprocessed_binding(target, normalized_vertices, faces,
+            normalized_joints, sampled_points, dense, trace_binding ? &trace : nullptr) :
+        detail::integrate_learned_binding(target, normalized_vertices,
+            sampled_points, dense, trace_binding ? &trace : nullptr);
     dump_binding_trace_if_requested(dense, output, normalized_vertices,
-                                    trace.neighbor_indices, trace.interpolation_weights);
+                                    trace.neighbor_indices, trace.interpolation_weights,
+                                    trace.surface_weights, trace.final_dense_weights);
     return output;
 }
 
@@ -333,12 +536,16 @@ void dump_binary(const std::filesystem::path & path, std::span<const T> values) 
 }
 
 void dump_mesh_input_if_requested(const sampled_cloud & sampled,
+                                  std::span<const triangle> topology,
                                   std::span<const std::int32_t> queries) {
     const char * prefix = std::getenv("SKINTOKENS_DUMP_MESH_INPUT_PREFIX");
     if (prefix == nullptr || *prefix == '\0') return;
     const std::filesystem::path base{prefix};
     dump_binary(base.string() + ".points.f32", std::span{sampled.points});
     dump_binary(base.string() + ".normals.f32", std::span{sampled.normals});
+    dump_binary(base.string() + ".faces.u32", std::span{sampled.faces});
+    dump_binary(base.string() + ".barycentric.f64", std::span{sampled.barycentric});
+    dump_binary(base.string() + ".topology.u32", topology);
     dump_binary(base.string() + ".queries.i32", queries);
 }
 
@@ -361,6 +568,12 @@ void dump_token_trace_if_requested(std::span<const std::int32_t> prefix,
     const std::filesystem::path base{base_value};
     dump_binary(base.string() + ".prefix.i32", prefix);
     dump_binary(base.string() + ".codes.i32", codes);
+}
+
+void dump_token_prefix_if_requested(std::span<const std::int32_t> prefix) {
+    const char * path = std::getenv("SKINTOKENS_DUMP_TOKEN_TRACE_PREFIX");
+    if (path == nullptr || *path == '\0') return;
+    dump_binary(std::string{path} + ".prefix.i32", prefix);
 }
 
 } // namespace
@@ -430,7 +643,7 @@ result<skin> model::rig(const mesh & source, const generation_options & options)
     auto sampled = sample_mesh_surface(source, normalized, normals, options.seed);
     if (!sampled) return std::unexpected(sampled.error());
     auto mesh_queries = sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
-    dump_mesh_input_if_requested(*sampled, mesh_queries);
+    dump_mesh_input_if_requested(*sampled, source.faces, mesh_queries);
     auto mesh_condition = detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
         sampled->points, sampled->normals, mesh_queries);
     if (!mesh_condition) return std::unexpected(mesh_condition.error());
@@ -448,8 +661,14 @@ result<skin> model::rig(const mesh & source, const generation_options & options)
     if (model_target->names.size() != generated->joint_count)
         return std::unexpected(detail::fail(error_code::compute, "generated skeleton parser disagrees with TokenRig"));
     auto target = from_model_space(*model_target);
+    std::vector<vec3> normalized_joints;
+    normalized_joints.reserve(model_target->rest_positions.size());
+    for (const auto value : model_target->rest_positions)
+        normalized_joints.push_back({(value.x-center.x)/scale, (value.y-center.y)/scale,
+                                     (value.z-center.z)/scale});
     return decode_binding(*impl_->skin_vae_weights, impl_->backend->value, target,
-        generated->skin_codes, *vae_condition, sampled->points, sampled->normals, normalized);
+        generated->skin_codes, *vae_condition, sampled->points, sampled->normals, normalized,
+        source.faces, normalized_joints, options.surface_postprocess);
 }
 
 result<skin> model::bind(const mesh & source, const skeleton & target, const generation_options & options) const {
@@ -463,12 +682,14 @@ result<skin> model::bind(const mesh & source, const skeleton & target, const gen
     const auto model_target = to_model_space(target);
     auto prefix = detail::tokenize_skeleton_prefix(model_source, model_target);
     if (!prefix) return std::unexpected(prefix.error());
+    dump_token_prefix_if_requested(prefix->tokens);
     if (options.geometric_only) return geometric_binding(source, target);
     auto normals = model_source.normals;
-    auto sampled = sample_mesh_surface(source, prefix->normalized_vertices, normals, options.seed);
+    auto sampled = sample_mesh_surface(source, prefix->normalized_vertices, normals, options.seed,
+        prefix->precise_normalized_vertices);
     if (!sampled) return std::unexpected(sampled.error());
     auto mesh_queries = sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
-    dump_mesh_input_if_requested(*sampled, mesh_queries);
+    dump_mesh_input_if_requested(*sampled, source.faces, mesh_queries);
     auto mesh_condition = detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
         sampled->points, sampled->normals, mesh_queries);
     if (!mesh_condition) return std::unexpected(mesh_condition.error());
@@ -478,12 +699,20 @@ result<skin> model::bind(const mesh & source, const skeleton & target, const gen
         sampled->points, sampled->normals, vae_queries);
     if (!vae_condition) return std::unexpected(vae_condition.error());
     dump_vae_trace_if_requested(*sampled, vae_queries, *vae_condition);
-    auto codes = detail::generate_skin_codes(*impl_->tokenrig_weights, impl_->backend->value,
-        *mesh_condition, prefix->tokens, target.names.size(), options);
-    if (!codes) return std::unexpected(codes.error());
-    dump_token_trace_if_requested(prefix->tokens, *codes);
+    auto forced = forced_skin_codes(target.names.size());
+    if (!forced) return std::unexpected(forced.error());
+    std::vector<std::int32_t> codes;
+    if (*forced) codes = std::move(**forced);
+    else {
+        auto generated = detail::generate_skin_codes(*impl_->tokenrig_weights, impl_->backend->value,
+            *mesh_condition, prefix->tokens, target.names.size(), options);
+        if (!generated) return std::unexpected(generated.error());
+        codes = std::move(*generated);
+    }
+    dump_token_trace_if_requested(prefix->tokens, codes);
     return decode_binding(*impl_->skin_vae_weights, impl_->backend->value, target,
-        *codes, *vae_condition, sampled->points, sampled->normals, prefix->normalized_vertices);
+        codes, *vae_condition, sampled->points, sampled->normals, prefix->normalized_vertices,
+        source.faces, prefix->normalized_joints, options.surface_postprocess);
 }
 
 std::string_view model::backend_name() const noexcept {
@@ -605,81 +834,6 @@ result<motion> fit_motion_to_mesh(const mesh & geometry, const motion & animatio
         value = {fitted_root.x + (value.x - first_root.x) * scale,
                  fitted_root.y + (value.y - first_root.y) * scale,
                  fitted_root.z + (value.z - first_root.z) * scale};
-    }
-    return output;
-}
-
-result<motion> retarget_motion_to_rig(const motion & animation, const skeleton & target) {
-    auto valid_source = validate_skeleton(animation.rig);
-    if (!valid_source) return std::unexpected(valid_source.error());
-    auto valid_target = validate_skeleton(target);
-    if (!valid_target) return std::unexpected(valid_target.error());
-    if (animation.frames == 0U || animation.root_translations.size() != animation.frames ||
-        animation.local_rotations.size() != animation.frames * animation.rig.names.size())
-        return std::unexpected(detail::fail(error_code::invalid_argument, "motion arrays are incomplete"));
-    const auto bounds = [](std::span<const vec3> points) {
-        std::pair<vec3, vec3> output{points.front(), points.front()};
-        for (const auto value : points) {
-            output.first.x=std::min(output.first.x,value.x); output.first.y=std::min(output.first.y,value.y); output.first.z=std::min(output.first.z,value.z);
-            output.second.x=std::max(output.second.x,value.x); output.second.y=std::max(output.second.y,value.y); output.second.z=std::max(output.second.z,value.z);
-        }
-        return output;
-    };
-    const auto source_bounds = bounds(animation.rig.rest_positions), target_bounds = bounds(target.rest_positions);
-    const auto center_scale = [](const auto & value) {
-        const vec3 center{(value.first.x+value.second.x)*0.5F,(value.first.y+value.second.y)*0.5F,
-                          (value.first.z+value.second.z)*0.5F};
-        const float scale=std::max({value.second.x-value.first.x,value.second.y-value.first.y,value.second.z-value.first.z});
-        return std::pair{center, scale};
-    };
-    const auto [source_center, source_scale] = center_scale(source_bounds);
-    const auto [target_center, target_scale] = center_scale(target_bounds);
-    if (source_scale <= 1e-8F || target_scale <= 1e-8F)
-        return std::unexpected(detail::fail(error_code::invalid_argument, "cannot retarget a degenerate skeleton"));
-    const auto normalize = [](vec3 value, vec3 center, float scale) {
-        return vec3{(value.x-center.x)/scale,(value.y-center.y)/scale,(value.z-center.z)/scale};
-    };
-    std::vector<vec3> source_position, target_position;
-    for (const auto value : animation.rig.rest_positions) source_position.push_back(normalize(value,source_center,source_scale));
-    for (const auto value : target.rest_positions) target_position.push_back(normalize(value,target_center,target_scale));
-    const auto is_descendant = [&](std::size_t candidate, std::int32_t ancestor) {
-        if (ancestor < 0) return true;
-        std::int32_t cursor=static_cast<std::int32_t>(candidate);
-        while (cursor >= 0) { if (cursor == ancestor) return true; cursor=animation.rig.parents[static_cast<std::size_t>(cursor)]; }
-        return false;
-    };
-    std::vector<std::size_t> mapping(target.names.size(), 0U);
-    for (std::size_t joint=0; joint<target.names.size(); ++joint) {
-        if (target.parents[joint] < 0) { mapping[joint]=0U; continue; }
-        const auto mapped_parent=mapping[static_cast<std::size_t>(target.parents[joint])];
-        float best=std::numeric_limits<float>::infinity(); std::size_t best_index=mapped_parent;
-        for (std::size_t candidate=0; candidate<source_position.size(); ++candidate) {
-            if (!is_descendant(candidate, static_cast<std::int32_t>(mapped_parent))) continue;
-            const float x=source_position[candidate].x-target_position[joint].x;
-            const float y=source_position[candidate].y-target_position[joint].y;
-            const float z=source_position[candidate].z-target_position[joint].z;
-            float score=x*x+y*y+z*z;
-            if ((source_position[candidate].x < -0.03F) != (target_position[joint].x < -0.03F) &&
-                std::abs(target_position[joint].x)>0.08F) score += 1.0F;
-            if (score < best) { best=score; best_index=candidate; }
-        }
-        mapping[joint]=best_index;
-    }
-    motion output;
-    output.frames=animation.frames; output.frames_per_second=animation.frames_per_second; output.rig=target;
-    output.local_rotations.resize(output.frames*target.names.size());
-    for (std::size_t frame=0; frame<output.frames; ++frame)
-        for (std::size_t joint=0; joint<target.names.size(); ++joint)
-            output.local_rotations[frame*target.names.size()+joint]=
-                animation.local_rotations[frame*animation.rig.names.size()+mapping[joint]];
-    output.root_translations.resize(output.frames);
-    const vec3 source_first=animation.root_translations.front(), target_root=target.rest_positions.front();
-    const float travel_scale=target_scale/source_scale;
-    for (std::size_t frame=0; frame<output.frames; ++frame) {
-        const auto value=animation.root_translations[frame];
-        output.root_translations[frame]={target_root.x+(value.x-source_first.x)*travel_scale,
-                                         target_root.y+(value.y-source_first.y)*travel_scale,
-                                         target_root.z+(value.z-source_first.z)*travel_scale};
     }
     return output;
 }

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Replace an animation fixture's expected binding with an upstream SkinVAE run.
+"""Replace an animation fixture with the final upstream binding endpoint.
 
 The C++ binding run must be made with SKINTOKENS_DUMP_VAE_TRACE_PREFIX and
 SKINTOKENS_DUMP_TOKEN_TRACE_PREFIX. This script consumes those exact sampled
 points, condition query indices and generated FSQ codes. It independently evaluates
-the released safetensors SkinVAE, reproduces upstream's eight-neighbour
-interpolation and learned-weight top-four export, then writes reference dense
-and sparse influences plus final animated vertices.
+the released safetensors SkinVAE, calls upstream's eight-neighbour interpolation
+and voxel_skin postprocess, then writes the final normalized dense matrix,
+exported top-four influences, and animated vertices.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -70,14 +71,18 @@ def main() -> None:
                         help="backend that produced the C++ trace and animation GLB")
     parser.add_argument("--query-chunk", type=int, default=8192)
     parser.add_argument("--nearest-chunk", type=int, default=256)
+    parser.add_argument("--upstream-root", type=Path, default=Path("reference/upstream"),
+                        help="official SkinTokens checkout used for final voxel_skin")
     args = parser.parse_args()
 
     manifest_path = args.fixture / "animation-vertices.json"
     manifest = json.loads(manifest_path.read_text())
     vertices = manifest["vertex_count"]
+    face_count = manifest["face_count"]
     joints_count = manifest["joint_count"]
     frames_count = manifest["frame_count"]
     positions = np.fromfile(args.fixture / "positions.f32", "<f4").reshape(vertices, 3)
+    faces = np.fromfile(args.fixture / "faces.u32", "<u4").reshape(face_count, 3)
     np.fromfile(args.fixture / "joints.u16", "<u2").reshape(vertices, 4)
     np.fromfile(args.fixture / "weights.f32", "<f4").reshape(vertices, 4)
     parents = np.fromfile(args.fixture / "parents.i32", "<i4")
@@ -207,27 +212,18 @@ def main() -> None:
         center = (low + high) * .5
         scale = (high - low).max() * .5
         normalized = (model_vertices - center) / scale
+        normalized_joints = (model_joints - center) / scale
 
-        samples_gpu = torch.from_numpy(sampled_points).to(device)
-        normalized_gpu = torch.from_numpy(normalized.astype("<f4")).to(device)
-        nearest_indices = np.empty((vertices, 8), dtype=np.int64)
-        nearest_distances = np.empty((vertices, 8), dtype=np.float32)
-        for begin in range(0, vertices, args.nearest_chunk):
-            end = min(begin + args.nearest_chunk, vertices)
-            distances = torch.cdist(normalized_gpu[begin:end], samples_gpu)
-            values, indices = torch.topk(distances, 8, largest=False, sorted=True)
-            nearest_indices[begin:end] = indices.cpu().numpy()
-            nearest_distances[begin:end] = values.cpu().numpy()
+        # Asset.from_data() uses SciPy cKDTree directly. Capturing with
+        # torch.cdist/topk is close numerically but is not the upstream
+        # endpoint and can change the fourth selected bone on near ties.
+        from scipy.spatial import cKDTree
+        nearest_distances, nearest_indices = cKDTree(sampled_points).query(normalized, k=8)
+        nearest_distances = nearest_distances.astype(np.float32)
 
     interpolation = 1.0 / (nearest_distances + 1e-8)
     interpolation /= interpolation.sum(axis=1, keepdims=True)
-    def integrate(dense_values: np.ndarray, indices: np.ndarray,
-                  neighbor_weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # Asset.from_data() interpolates every learned joint channel from the
-        # sampled cloud. The Blender exporter then chooses the greatest four
-        # learned weights and normalizes only those four. Bone distance is not
-        # part of either upstream operation.
-        interpolated = np.einsum("vk,vkj->vj", neighbor_weights, dense_values[indices])
+    def select_top_four(interpolated: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         top = np.argsort(-interpolated, axis=1, kind="stable")[:, :4]
         output_joints = top.astype("<u2")
         output_weights = np.take_along_axis(interpolated, top, axis=1).astype("<f4")
@@ -237,10 +233,44 @@ def main() -> None:
         output_weights[empty, 0] = 1
         sums[empty, 0] = 1
         output_weights /= sums
+        return output_joints, output_weights
+
+    def integrate(dense_values: np.ndarray, indices: np.ndarray,
+                  neighbor_weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Asset.from_data() interpolates every learned joint channel from the
+        # sampled cloud. Keep this raw stage separately so it cannot be
+        # mistaken for the demo's final postprocessed binding.
+        interpolated = np.einsum("vk,vkj->vj", neighbor_weights, dense_values[indices])
+        output_joints, output_weights = select_top_four(interpolated)
         return interpolated.astype("<f4"), output_joints, output_weights
 
-    reference_dense, reference_joints, reference_weights = integrate(
+    raw_dense, raw_joints, raw_weights = integrate(
         dense, nearest_indices, interpolation)
+
+    # This is the final upstream demo endpoint, not a local approximation:
+    # call its own voxel_skin implementation, then perform the same normalize
+    # and top-four export. Raw learned parity is retained as an earlier stage.
+    sys.path.insert(0, str(args.upstream_root.resolve()))
+    import open3d as o3d
+    from src.data.vertex_group import voxel_skin
+    mesh_o3d = o3d.geometry.TriangleMesh()
+    mesh_o3d.vertices = o3d.utility.Vector3dVector(normalized.astype(np.float64))
+    mesh_o3d.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    max_d = np.max(np.max(normalized, axis=1) - np.min(normalized, axis=1))
+    voxel_size = float(max_d / 196.0)
+    voxel = o3d.geometry.VoxelGrid.create_from_triangle_mesh(mesh_o3d, voxel_size=voxel_size)
+    grid_coords = np.asarray([value.grid_index for value in voxel.get_voxels()], dtype=np.float64)
+    from scipy.spatial import cKDTree
+    _, surface_seeds = cKDTree(np.concatenate((normalized, grid_coords), axis=0)).query(
+        normalized_joints)
+    locality = voxel_skin(
+        grid=0, grid_coords=grid_coords, joints=normalized_joints,
+        vertices=normalized, faces=faces.astype(np.int64), mode="square",
+        voxel_size=voxel_size)
+    postprocessed = raw_dense * locality
+    postprocessed /= np.maximum(postprocessed.sum(axis=1, keepdims=True), 1e-30)
+    reference_joints, reference_weights = select_top_four(postprocessed)
+    reference_dense = postprocessed.astype("<f4")
 
     if args.cpp_binding_trace_prefix is not None:
         cpp_dense = np.fromfile(str(args.cpp_binding_trace_prefix) + ".dense.f32", "<f4").reshape(
@@ -256,8 +286,11 @@ def main() -> None:
         cpp_interpolation /= cpp_interpolation.sum(axis=1, keepdims=True)
         manifest["normalized_vertices_max_abs"] = float(np.max(np.abs(cpp_normalized - normalized)))
         manifest["nearest_neighbor_slot_agreement"] = float(np.mean(cpp_neighbors == nearest_indices))
-        _, cpp_py_joints, cpp_py_weights = integrate(
+        cpp_raw_dense, _, _ = integrate(
             cpp_dense, cpp_neighbors, cpp_interpolation)
+        cpp_expected_dense = cpp_raw_dense * locality
+        cpp_expected_dense /= np.maximum(cpp_expected_dense.sum(axis=1, keepdims=True), 1e-30)
+        cpp_py_joints, cpp_py_weights = select_top_four(cpp_expected_dense)
         cpp_joints = np.fromfile(str(args.cpp_binding_trace_prefix) + ".joints.u16", "<u2").reshape(vertices, 4)
         cpp_weights = np.fromfile(str(args.cpp_binding_trace_prefix) + ".weights.f32", "<f4").reshape(vertices, 4)
         cpp_py_dense = np.zeros((vertices, joints_count), dtype=np.float32)
@@ -273,6 +306,14 @@ def main() -> None:
         manifest["cpp_postprocess_reproduction_relative_l2"] = float(
             np.linalg.norm(post_difference.ravel()) /
             max(np.linalg.norm(cpp_py_dense.astype(np.float64).ravel()), 1e-30))
+        final_dense_path = Path(str(args.cpp_binding_trace_prefix) + ".final-dense.f32")
+        if final_dense_path.exists():
+            cpp_traced_dense = np.fromfile(final_dense_path, "<f4").reshape(vertices, joints_count)
+            traced_difference = cpp_traced_dense.astype(np.float64) - cpp_expected_dense.astype(np.float64)
+            manifest["cpp_final_dense_reproduction_max_abs"] = float(np.max(np.abs(traced_difference)))
+            manifest["cpp_final_dense_reproduction_relative_l2"] = float(
+                np.linalg.norm(traced_difference.ravel()) /
+                max(np.linalg.norm(cpp_expected_dense.astype(np.float64).ravel()), 1e-30))
         cpp_support = cpp_final_dense > 0
         reference_support = reference_final_dense > 0
         manifest["binding_top4_exact_vertex_fraction"] = float(np.mean(
@@ -289,9 +330,17 @@ def main() -> None:
     condition_queries.astype("<i4").tofile(args.fixture / "skin-queries.i32")
     codes.astype("<i4").tofile(args.fixture / "skin-codes.i32")
     normalized.astype("<f4").tofile(args.fixture / "normalized-vertices.f32")
+    normalized_joints.astype("<f4").tofile(args.fixture / "normalized-joints.f32")
+    faces.astype("<u4").tofile(args.fixture / "faces.u32")
     nearest_indices.astype("<u4").tofile(args.fixture / "reference-neighbors.u32")
     interpolation.astype("<f4").tofile(args.fixture / "reference-interpolation.f32")
     reference_dense.tofile(args.fixture / "reference-dense-weights.f32")
+    raw_dense.tofile(args.fixture / "reference-raw-dense-weights.f32")
+    raw_joints.tofile(args.fixture / "reference-raw-joints.u16")
+    raw_weights.tofile(args.fixture / "reference-raw-weights.f32")
+    locality.astype("<f4").tofile(args.fixture / "reference-surface-weights.f32")
+    grid_coords.astype("<i4").tofile(args.fixture / "reference-voxel-coordinates.i32")
+    surface_seeds.astype("<u4").tofile(args.fixture / "reference-surface-seeds.u32")
     reference_joints.tofile(args.fixture / "reference-joints.u16")
     reference_weights.tofile(args.fixture / "reference-weights.f32")
     expected = animated_vertices(positions, reference_joints, reference_weights, parents, rest,
@@ -299,9 +348,11 @@ def main() -> None:
     expected.tofile(args.fixture / "expected-vertices.f32")
     manifest["reference"] = (
         "released SkinVAE safetensors in direct PyTorch F32 plus upstream "
-        "Asset.from_data interpolation and Blender top-four export")
+        "Asset.from_data interpolation, voxel_skin postprocess, and Blender top-four export")
     manifest["cpp_backend"] = args.cpp_backend
-    manifest["binding_selection"] = "top four interpolated learned weights"
+    manifest["binding_selection"] = "top four postprocessed learned weights"
+    manifest["voxel_size"] = voxel_size
+    manifest["voxel_count"] = len(grid_coords)
     if args.cpp_backend == "cpu":
         manifest["binding_max_abs_tolerance"] = .01
         manifest["binding_relative_l2_tolerance"] = .001

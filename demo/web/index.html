@@ -13,8 +13,24 @@
       <label for="motionSource">Kimodo motion</label><select id="motionSource"><option value="">Upload a motion…</option></select>
       <label class="file"><input id="motion" type="file" accept=".glb,model/gltf-binary"><b>Choose animation GLB</b><small id="motionName">No upload selected</small></label>
     </section>
+    <section class="card">
+      <label for="targetRig">SkinTokens skeleton A/B</label>
+      <select id="targetRig">
+        <option value="soma30">A · SOMA30 directly</option>
+        <option value="mixamo52">B · retarget to Mixamo52</option>
+      </select>
+      <small class="hint">Both lanes use the learned existing-skeleton path. Mixamo52 uses an explicit anatomical map, not nearest-joint matching.</small>
+    </section>
+    <section class="card example" id="giraffeExample" hidden>
+      <h2>Official SkinTokens giraffe</h2>
+      <p>Inspect the upstream exemplar before comparing it with humanoid bindings.</p>
+      <div class="example-actions">
+        <button id="giraffeInput" hidden>Input mesh</button>
+        <button id="giraffeResult" hidden>Learned rig</button>
+      </div>
+    </section>
     <button id="bind">Bind and animate</button><div id="status" class="status">Ready</div>
-    <div class="notice">Binding runs the released TokenRig and SkinVAE weights through GGML. Kimodo supplies the humanoid hierarchy; SkinTokens predicts mesh-specific weights. Detailed characters can take several minutes until generation gains a KV cache.</div>
+    <div class="notice">Binding runs the released TokenRig and SkinVAE weights through GGML, then applies upstream's voxel-surface locality postprocess to prevent remote bones influencing disconnected body regions. Compare direct SOMA30 conditioning with the semantically retargeted Mixamo52 topology on the same inputs.</div>
     <section class="history"><h2>Past bindings</h2><div id="history">Loading…</div></section>
   </aside>
   <section class="stage"><canvas id="view"></canvas><div class="empty" id="empty">Choose a completed binding to preview it</div>
@@ -22,5 +38,5 @@
     <div class="joint-hover" id="jointHover" hidden></div>
     <div class="controls"><button id="play">Pause</button><button id="rest">Rest pose</button><button id="reset">Reset view</button><a id="download" download="animation.glb" hidden>Download GLB</a><input id="timeline" type="range" min="0" max="1" step=".001" value="0"><span id="time">0:00 / 0:00</span></div>
   </section>
-</main><a class="localai" href="https://localai.io" target="_blank" rel="noreferrer">LocalAI</a>
+</main><a class="localai" href="https://localai.io" target="_blank" rel="noreferrer" aria-label="LocalAI"><img src="/localai.png" alt="LocalAI"></a>
 <script src="/app.js"></script></body></html>

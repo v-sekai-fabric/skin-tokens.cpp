@@ -37,13 +37,10 @@ def main() -> None:
         return F.layer_norm(x, (x.shape[-1],), w(stem + ".weight"), w(stem + ".bias"), 1e-5)
 
     def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        batch, query, width = q.shape
-        data, heads, dim = k.shape[1], 8, width // 8
-        q = q.view(batch, query, heads, dim).transpose(1, 2)
-        k = k.view(batch, data, heads, dim).transpose(1, 2)
-        v = v.view(batch, data, heads, dim).transpose(1, 2)
+        batch, query, heads, dim = q.shape
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
         value = F.scaled_dot_product_attention(q, k, v)
-        return value.transpose(1, 2).contiguous().view(batch, query, width)
+        return value.transpose(1, 2).contiguous().view(batch, query, heads * dim)
 
     def mlp(x: torch.Tensor, stem: str) -> torch.Tensor:
         return linear(F.gelu(linear(x, stem + ".c_fc")), stem + ".c_proj")
@@ -63,15 +60,15 @@ def main() -> None:
     state = projected[:, queries]
     stem = base + ".cross_attn"
     qn, dn = norm(state, stem + ".ln_1"), norm(projected, stem + ".ln_2")
-    q = linear(qn, stem + ".attn.c_q")
-    kv = linear(dn, stem + ".attn.c_kv")
+    q = linear(qn, stem + ".attn.c_q").view(1, len(queries), 8, -1)
+    kv = linear(dn, stem + ".attn.c_kv").view(1, projected.shape[1], 8, -1)
     k, v = kv.chunk(2, dim=-1)
     state = state + linear(attention(q, k, v), stem + ".attn.c_proj")
     state = state + mlp(norm(state, stem + ".ln_3"), stem + ".mlp")
     for index in range(8):
         stem = f"{base}.self_attn.resblocks.{index}"
         qkv = linear(norm(state, stem + ".ln_1"), stem + ".attn.c_qkv")
-        q, k, v = qkv.chunk(3, dim=-1)
+        q, k, v = qkv.view(1, len(queries), 8, -1).chunk(3, dim=-1)
         state = state + linear(attention(q, k, v), stem + ".attn.c_proj")
         state = state + mlp(norm(state, stem + ".ln_2"), stem + ".mlp")
     state = norm(state, base + ".ln_post")

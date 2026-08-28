@@ -134,6 +134,9 @@ def main() -> None:
     positions = accessor(root, binary, attributes["POSITION"]).astype("<f4")
     joints = accessor(root, binary, attributes["JOINTS_0"]).astype("<u2")
     weights = accessor(root, binary, attributes["WEIGHTS_0"]).astype("<f4")
+    if "indices" not in primitive:
+        raise ValueError("parity capture requires an indexed triangle mesh")
+    faces = accessor(root, binary, primitive["indices"]).astype("<u4").reshape(-1, 3)
     if positions.shape[1:] != (3,) or joints.shape != (len(positions), 4) or weights.shape != joints.shape:
         raise ValueError("unexpected skinned vertex stream shape")
     inverse_bind = accessor(root, binary, skin["inverseBindMatrices"]).astype(np.float64)
@@ -204,6 +207,7 @@ def main() -> None:
     positions.tofile(args.output / "positions.f32")
     joints.tofile(args.output / "joints.u16")
     weights.tofile(args.output / "weights.f32")
+    faces.tofile(args.output / "faces.u32")
     parents.tofile(args.output / "parents.i32")
     rest_positions.tofile(args.output / "rest-positions.f32")
     root_translations.astype("<f4").tofile(args.output / "root-translations.f32")
@@ -216,6 +220,7 @@ def main() -> None:
         "source_sha256": hashlib.sha256(args.glb.read_bytes()).hexdigest(),
         "vertex_count": len(positions),
         "joint_count": joint_count,
+        "face_count": len(faces),
         "frame_count": frame_count,
         "frames_per_second": fps,
         "selected_frames": frames,

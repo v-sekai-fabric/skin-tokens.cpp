@@ -35,6 +35,7 @@ type record struct {
 	CreatedAt  int64  `json:"createdAt"`
 	FinishedAt int64  `json:"finishedAt,omitempty"`
 	Learned    bool   `json:"learned"`
+	TargetRig  string `json:"targetRig"`
 	MeshPath   string `json:"-"`
 	MotionPath string `json:"-"`
 }
@@ -135,7 +136,8 @@ func (s *server) worker() {
 		output := filepath.Join(s.data, id, "animation.glb")
 		if err == nil {
 			command := exec.CommandContext(ctx, s.cli, "bind", s.model, meshPath, value.MotionPath,
-				output, "--device", s.device, "--supplied-skeleton")
+				output, "--device", s.device, "--supplied-skeleton", "--target-rig", value.TargetRig,
+				"--postprocess")
 			combined, err = command.CombinedOutput()
 		}
 		cancel()
@@ -223,7 +225,15 @@ func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	value := &record{ID: id, State: "queued", CreatedAt: time.Now().UnixMilli()}
+	targetRig := r.FormValue("targetRig")
+	if targetRig == "" {
+		targetRig = "soma30"
+	}
+	if targetRig != "soma30" && targetRig != "mixamo52" {
+		http.Error(w, "target rig must be soma30 or mixamo52", 400)
+		return
+	}
+	value := &record{ID: id, State: "queued", CreatedAt: time.Now().UnixMilli(), TargetRig: targetRig}
 	resolve := func(kind string) (string, string, error) {
 		if sourceID := r.FormValue(kind + "Source"); sourceID != "" {
 			item, ok := s.sources[sourceID]
@@ -322,6 +332,22 @@ func scanSources(root, kind string, output map[string]source) {
 	})
 }
 
+func addExampleSource(id, name, kind, path, label string, output map[string]source) {
+	if path == "" {
+		return
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(absolute)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 512<<20 ||
+		!strings.EqualFold(filepath.Ext(absolute), ".glb") {
+		return
+	}
+	output[id] = source{ID: id, Name: name, Kind: kind, Path: absolute, Label: label}
+}
+
 func restore(directory string) map[string]*record {
 	values := map[string]*record{}
 	entries, _ := os.ReadDir(directory)
@@ -335,6 +361,9 @@ func restore(directory string) map[string]*record {
 		}
 		var value record
 		if json.Unmarshal(data, &value) == nil {
+			if value.TargetRig == "" {
+				value.TargetRig = "soma30"
+			}
 			if value.State == "running" || value.State == "remeshing" || value.State == "queued" {
 				value.State = "error"
 				value.Error = "server stopped before completion"
@@ -346,15 +375,17 @@ func restore(directory string) map[string]*record {
 }
 
 func main() {
-	listen := flag.String("listen", "0.0.0.0:8095", "listen address")
+	listen := flag.String("listen", "127.0.0.1:8095", "listen address")
 	data := flag.String("data", "demo-data", "persistent output directory")
 	cli := flag.String("cli", "build/release/bin/skintokens-cli", "skintokens-cli path")
 	model := flag.String("model", "models/skintokens-f32", "GGUF bundle")
 	device := flag.String("device", "vulkan", "auto, cpu, or vulkan")
 	remesher := flag.String("trellis-mesh2glb", "", "trellis2cpp mesh2glb path (required for T2MESH inputs)")
 	targetQuads := flag.Int("target-quads", 20000, "quad-remesh density for T2MESH inputs")
-	kimodo := flag.String("kimodo", "../kimodo.cpp/demo-output", "Kimodo gallery directory")
-	trellis := flag.String("trellis", "../trellis2cpp/generations", "trellis2cpp gallery directory")
+	kimodo := flag.String("kimodo", "", "Kimodo gallery directory (empty disables it)")
+	trellis := flag.String("trellis", "", "trellis2cpp gallery directory (empty disables it)")
+	giraffeInput := flag.String("giraffe-input", "", "official SkinTokens giraffe input GLB (empty disables it)")
+	giraffeResult := flag.String("giraffe-result", "", "captured official SkinTokens giraffe result GLB (empty disables it)")
 	timeout := flag.Duration("timeout", 30*time.Minute, "binding timeout")
 	flag.Parse()
 	if *targetQuads < 100 || *targetQuads > 500000 {
@@ -368,6 +399,8 @@ func main() {
 		targetQuads: *targetQuads, timeout: *timeout}
 	scanSources(*kimodo, "motion", s.sources)
 	scanSources(*trellis, "mesh", s.sources)
+	addExampleSource("giraffe-input", "Giraffe input", "example-input", *giraffeInput, "Official SkinTokens example", s.sources)
+	addExampleSource("giraffe-result", "Giraffe learned rig", "example-result", *giraffeResult, "Official SkinTokens output", s.sources)
 	go s.worker()
 	assets, err := fs.Sub(web, "web")
 	if err != nil {

@@ -72,10 +72,11 @@ build/debug/bin/skintokens-animation-parity generated/animation-parity
 
 This layered full-model test holds the 54,000 sampled points, condition query
 indices and generated FSQ codes constant. Python independently evaluates the
-full F32 condition encoder and decoder, upstream inverse-distance 8-neighbour
-integration, learned-weight top-four export and animated vertices. It also
-writes a self-contained fixture for running the exact production C++ path on
-both backends:
+full F32 condition encoder and decoder, then calls the official upstream
+`Asset.from_data` interpolation and optional `voxel_skin` implementation. The
+fixture retains raw learned and postprocessed stages separately, plus final
+top-four influences and animated vertices. It also writes a self-contained
+fixture for running the exact production C++ path on both backends:
 
 ```sh
 build/debug/bin/skintokens-full-binding-parity \
@@ -84,10 +85,19 @@ build/debug/bin/skintokens-full-binding-parity \
   models/skintokens-f32 generated/animation-parity vulkan
 ```
 
-The final comparison asserts both continuous error and selected-bone support.
-The released attention processor uses an unusual concatenate-then-head-split
-Q/K/V layout; the reference captures and GGML graph preserve that layout
-exactly rather than using a conventional independent head reshape.
+To register those same full-model checks with CTest, configure with
+`SKINTOKENS_PARITY_MODEL_DIR` and `SKINTOKENS_PARITY_FIXTURE_DIR`. They are not
+registered in weight-free builds, so ordinary unit tests never download model
+files.
+
+The final comparison asserts continuous dense/sparse error, selected-bone
+support, and deformed vertices from the newly computed C++ binding. The
+released demo leaves `voxel_skin` disabled by default; it remains an explicit
+diagnostic rather than being conflated with normal raw learned export.
+The released attention processor reshapes each combined projection into heads
+before splitting K/V or Q/K/V within each head. The reference captures and
+GGML graph preserve that ordering exactly; splitting the flat projection into
+full-width Q/K/V blocks is not equivalent.
 
 `capture_upstream_binding.py` is a separate behavioral diagnostic that imports
 the official Lightning classes and runs their normal BF16 path. Do not use its
@@ -95,3 +105,36 @@ the official Lightning classes and runs their normal BF16 path. Do not use its
 rounds the PMPE frequency/phase buffers to BF16, and later promotion cannot
 recover them. The direct safetensor capture constructs those buffers in F32,
 matching this project's explicitly F32 model/activation milestone.
+
+## Official giraffe exemplar
+
+`capture_official_example.py` runs the only mesh exemplar checked into the
+upstream repository through its Blender loader, predict transform, full
+TokenRig generation, SkinVAE decoder, and exporter. It records both the normal
+released BF16 result and a clean F32 decode of the identical condition and FSQ
+codes. The capture also retains the optional voxel graph as a diagnostic.
+
+```sh
+docker run --rm --device nvidia.com/gpu=all \
+  --user "$(id -u):$(id -g)" --workdir /work/reference/upstream \
+  -e PYTHONPATH=/work/reference:/work/reference/upstream \
+  -v "$PWD:/work" --entrypoint python skintokens-reference:2.7 \
+  /work/reference/capture_official_example.py \
+  --upstream-root /work/reference/upstream \
+  --checkpoint /work/checkpoints/grpo_1400.ckpt \
+  --skin-checkpoint /work/checkpoints/last.ckpt \
+  --input /work/reference/upstream/examples/giraffe.glb \
+  --output /work/generated/giraffe-upstream-full --seed 0
+
+build/debug/bin/skintokens-giraffe-parity \
+  models/skintokens-f32 generated/giraffe-upstream-full cpu
+build/debug/bin/skintokens-giraffe-parity \
+  models/skintokens-f32 generated/giraffe-upstream-full vulkan
+```
+
+Acceptance covers the learned decoder, raw dense vertex weights, and raw
+exported top-four weights—the upstream demo's default endpoint. The BF16
+production result and opt-in `voxel_skin` endpoint are printed separately so
+arithmetic-mode or heuristic drift remains visible. In particular, passing the
+F32 milestone does not claim that released CUDA BF16 arithmetic is identical;
+the tool reports that behavioral delta explicitly.

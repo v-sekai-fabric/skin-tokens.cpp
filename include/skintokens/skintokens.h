@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define ST_ABI_VERSION 1U
+
 #if defined(_WIN32) && defined(SKINTOKENS_SHARED)
 #  if defined(SKINTOKENS_BUILD)
 #    define ST_API __declspec(dllexport)
@@ -36,6 +38,12 @@ typedef enum st_status {
 
 typedef enum st_device { ST_DEVICE_AUTO = 0, ST_DEVICE_CPU = 1, ST_DEVICE_VULKAN = 2 } st_device;
 
+typedef enum st_target_rig {
+    ST_TARGET_GENERATED = 0,
+    ST_TARGET_SOMA30 = 1,
+    ST_TARGET_MIXAMO52 = 2
+} st_target_rig;
+
 typedef struct st_runtime_options {
     st_device device;
     uint32_t threads;
@@ -51,10 +59,24 @@ typedef struct st_generation_options {
     uint32_t beams;
     size_t max_tokens;
     int geometric_only;
+    st_target_rig target_rig;
+    int surface_postprocess;
 } st_generation_options;
+
+typedef struct st_mesh_info {
+    size_t vertex_count;
+    size_t triangle_count;
+} st_mesh_info;
+
+typedef struct st_motion_info {
+    size_t frame_count;
+    size_t joint_count;
+    float frames_per_second;
+} st_motion_info;
 
 /* Return versioned library defaults. Prefer these over zero-initialising an
  * options structure so future defaults remain source-compatible. */
+ST_API uint32_t st_abi_version(void);
 ST_API st_runtime_options st_default_runtime_options(void);
 ST_API st_generation_options st_default_generation_options(void);
 
@@ -64,14 +86,23 @@ ST_API void st_model_free(st_model * value);
 ST_API const char * st_model_backend_name(const st_model * value);
 ST_API const char * st_model_last_error(const st_model * value);
 
+/* Parse and validate an input without loading model weights. These functions
+ * are useful for upload validation and are covered through the public C ABI by
+ * the sanitizer/libFuzzer target. */
+ST_API st_status st_inspect_mesh_file(const char * path, st_mesh_info * output,
+                                      char * error, size_t error_capacity);
+ST_API st_status st_inspect_motion_glb_file(const char * path, st_motion_info * output,
+                                            char * error, size_t error_capacity);
+
 ST_API st_status st_bind_glb_files(st_model * value, const char * mesh_path,
                                    const char * kimodo_motion_path, const char * output_path,
                                    const st_generation_options * options, int * learned,
                                    char * error, size_t error_capacity);
 
 /* Preferred file API. Mesh input may be GLB or trellis2cpp T2MESH; motion and
- * output are GLB. The default generates a mesh-native TokenRig skeleton and
- * retargets the Kimodo motion. geometric_only binds the fitted Kimodo rig. */
+ * output are GLB. Defaults bind the fitted SOMA30 hierarchy supplied by the
+ * Kimodo motion. target_rig may instead request Mixamo52 or an unconstrained
+ * generated rig; geometric_only bypasses learned skin-weight generation. */
 ST_API st_status st_bind_files(st_model * value, const char * mesh_path,
                                const char * kimodo_motion_path, const char * output_path,
                                const st_generation_options * options, int * learned,

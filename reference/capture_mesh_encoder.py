@@ -28,12 +28,10 @@ def main() -> None:
     def norm(x: torch.Tensor, stem: str) -> torch.Tensor:
         return F.layer_norm(x, (x.shape[-1],), w(stem + ".weight"), w(stem + ".bias"), 1e-5)
     def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int = 8) -> torch.Tensor:
-        batch, query, width = q.shape; data = k.shape[1]; dim = width // heads
-        q = q.view(batch, query, heads, dim).transpose(1, 2)
-        k = k.view(batch, data, heads, dim).transpose(1, 2)
-        v = v.view(batch, data, heads, dim).transpose(1, 2)
+        batch, query, _, dim = q.shape
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
         p = torch.softmax(torch.matmul(q, k.transpose(2, 3)) / np.sqrt(dim), dim=-1)
-        return torch.matmul(p, v).transpose(1, 2).contiguous().view(batch, query, width)
+        return torch.matmul(p, v).transpose(1, 2).contiguous().view(batch, query, heads * dim)
     def mlp(x: torch.Tensor, stem: str) -> torch.Tensor:
         return linear(F.gelu(linear(x, stem + ".c_fc")), stem + ".c_proj")
 
@@ -50,8 +48,8 @@ def main() -> None:
 
     stem = base + ".cross_attn"
     qn, dn = norm(query, stem + ".ln_1"), norm(projected, stem + ".ln_2")
-    q = linear(qn, stem + ".attn.c_q")
-    kv = linear(dn, stem + ".attn.c_kv"); k, v = kv.chunk(2, dim=-1)
+    q = linear(qn, stem + ".attn.c_q").view(1, len(query_indices), 8, -1)
+    kv = linear(dn, stem + ".attn.c_kv").view(1, projected.shape[1], 8, -1); k, v = kv.chunk(2, dim=-1)
     query = query + linear(attention(q, k, v), stem + ".attn.c_proj")
     query = query + mlp(norm(query, stem + ".ln_3"), stem + ".mlp")
     captured = {"points": points, "normals": normals, "embedded": embedded,
@@ -59,7 +57,7 @@ def main() -> None:
     for index in range(8):
         stem = f"{base}.self_attn.resblocks.{index}"
         qkv = linear(norm(query, stem + ".ln_1"), stem + ".attn.c_qkv")
-        q, k, v = qkv.chunk(3, dim=-1)
+        q, k, v = qkv.view(1, len(query_indices), 8, -1).chunk(3, dim=-1)
         query = query + linear(attention(q, k, v), stem + ".attn.c_proj")
         query = query + mlp(norm(query, stem + ".ln_2"), stem + ".mlp")
         captured[f"self_{index + 1:02d}"] = query

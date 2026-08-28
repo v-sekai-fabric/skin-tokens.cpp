@@ -131,6 +131,39 @@ int main() {
     assert(retargeted && retargeted->rig.names.size() == 3U && retargeted->frames == animation.frames);
     assert(retargeted->local_rotations.size() == animation.frames * 3U);
     assert(retargeted->root_translations.front().x == generated_rig.rest_positions.front().x);
+
+    // The production A/B lane uses a semantic SOMA30 -> Mixamo52 map rather
+    // than the generic proximity fallback. Exercise the exact published
+    // Mixamo joint order and deterministic isolated-joint feedback loop.
+    skintokens::motion soma30;
+    soma30.frames = 2U;
+    soma30.frames_per_second = 30.0F;
+    soma30.rig.names = {"Hips","Spine1","Spine2","Chest","Neck1","Neck2","Head","Jaw","LeftEye","RightEye",
+        "LeftShoulder","LeftArm","LeftForeArm","LeftHand","LeftHandThumbEnd","LeftHandMiddleEnd",
+        "RightShoulder","RightArm","RightForeArm","RightHand","RightHandThumbEnd","RightHandMiddleEnd",
+        "LeftLeg","LeftShin","LeftFoot","LeftToeBase","RightLeg","RightShin","RightFoot","RightToeBase"};
+    soma30.rig.parents = {-1,0,1,2,3,4,5,6,6,6,3,10,11,12,13,13,3,16,17,18,19,19,0,22,23,24,0,26,27,28};
+    soma30.rig.rest_positions = {{0,1,0},{0,1.15F,0},{0,1.3F,0},{0,1.45F,0},{0,1.58F,0},{0,1.66F,0},{0,1.78F,0},
+        {0,1.72F,.04F},{-.03F,1.8F,.08F},{.03F,1.8F,.08F},{-.12F,1.46F,0},{-.35F,1.44F,0},{-.58F,1.35F,0},
+        {-.74F,1.25F,0},{-.84F,1.2F,.05F},{-.9F,1.2F,0},{.12F,1.46F,0},{.35F,1.44F,0},{.58F,1.35F,0},
+        {.74F,1.25F,0},{.84F,1.2F,.05F},{.9F,1.2F,0},{-.12F,.92F,0},{-.13F,.5F,0},{-.13F,.12F,.02F},
+        {-.13F,.03F,.18F},{.12F,.92F,0},{.13F,.5F,0},{.13F,.12F,.02F},{.13F,.03F,.18F}};
+    soma30.root_translations = {soma30.rig.rest_positions.front(), soma30.rig.rest_positions.front()};
+    soma30.local_rotations.assign(soma30.frames * soma30.rig.names.size(), {});
+    soma30.local_rotations[soma30.rig.names.size() + 11U] = {0,0,half_sqrt_two,half_sqrt_two};
+    auto mixamo52 = skintokens::make_mixamo52_rig(soma30.rig);
+    assert(mixamo52 && mixamo52->names.size() == 52U);
+    assert(mixamo52->names.front() == "mixamorig:Hips");
+    assert(mixamo52->names[10] == "mixamorig:LeftHandThumb1");
+    assert(mixamo52->names[25] == "mixamorig:RightShoulder");
+    assert(mixamo52->names[29] == "mixamorig:RightHandIndex1");
+    auto semantic = skintokens::retarget_soma30_to_mixamo52(soma30, *mixamo52);
+    assert(semantic && semantic->rig.names.size() == 52U);
+    assert(semantic->local_rotations[52U + 7U].z == half_sqrt_two);
+    auto validation = skintokens::validate_soma30_to_mixamo52(soma30, *mixamo52);
+    assert(validation && validation->isolated_cases >= 132U);
+    assert(std::isfinite(validation->isolated_mean_position_error));
+    assert(std::isfinite(validation->motion_mean_position_error));
     const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto output = std::filesystem::temp_directory_path() /
         ("skintokens-api-" + std::to_string(suffix) + ".glb");
@@ -138,6 +171,9 @@ int main() {
     assert(saved);
     auto loaded = skintokens::load_glb_file(output);
     assert(loaded && loaded->vertices.size() == 3U && loaded->faces.size() == 1U && loaded->colors.size() == 3U);
+    auto loaded_motion = skintokens::load_kimodo_glb_file(output);
+    assert(loaded_motion && loaded_motion->rig.names.size() == binding.rig.names.size());
+    assert(loaded_motion->rig.parents == binding.rig.parents);
     std::filesystem::remove(output);
 
     const auto source = std::filesystem::temp_directory_path() /

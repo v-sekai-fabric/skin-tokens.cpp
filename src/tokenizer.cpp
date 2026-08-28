@@ -20,33 +20,53 @@ result<skeleton_prefix> tokenize_skeleton_prefix(const mesh & source, const skel
     if (source.vertices.empty() || target.rest_positions.empty() ||
         target.parents.size() != target.rest_positions.size())
         return std::unexpected(fail(error_code::invalid_argument, "cannot tokenize empty mesh/skeleton"));
-    vec3 low = source.vertices.front();
-    vec3 high = low;
-    const auto include = [&](vec3 value, vec3 & minimum, vec3 & maximum) {
-        minimum.x = std::min(minimum.x, value.x); minimum.y = std::min(minimum.y, value.y); minimum.z = std::min(minimum.z, value.z);
-        maximum.x = std::max(maximum.x, value.x); maximum.y = std::max(maximum.y, value.y); maximum.z = std::max(maximum.z, value.z);
+    std::array<double, 3> low{source.vertices.front().x, source.vertices.front().y, source.vertices.front().z};
+    auto high = low;
+    const auto include = [&](vec3 value) {
+        const std::array<double, 3> precise{value.x, value.y, value.z};
+        for (std::size_t axis = 0; axis < 3U; ++axis) {
+            low[axis] = std::min(low[axis], precise[axis]);
+            high[axis] = std::max(high[axis], precise[axis]);
+        }
     };
-    for (const auto & value : source.vertices) include(value, low, high);
-    for (const auto & value : target.rest_positions) include(value, low, high);
-    const vec3 center{(low.x + high.x) * 0.5F, (low.y + high.y) * 0.5F, (low.z + high.z) * 0.5F};
-    const float scale = std::max({high.x - low.x, high.y - low.y, high.z - low.z}) * 0.5F;
-    if (!std::isfinite(scale) || scale <= 1e-12F)
+    for (const auto & value : source.vertices) include(value);
+    for (const auto & value : target.rest_positions) include(value);
+    const double half_extent = std::max({high[0] - low[0], high[1] - low[1], high[2] - low[2]}) * 0.5;
+    if (!std::isfinite(half_extent) || half_extent <= 1e-12)
         return std::unexpected(fail(error_code::invalid_argument, "mesh/skeleton bounds are degenerate"));
+    // AugmentAffine assembles and multiplies float32 translation/scale
+    // matrices, then applies the result to Blender's float64 coordinates.
+    const float inverse_scale = static_cast<float>(1.0 / half_extent);
+    std::array<float, 3> bias{};
+    for (std::size_t axis = 0; axis < 3U; ++axis)
+        bias[axis] = inverse_scale * static_cast<float>(-(high[axis] + low[axis]) * 0.5);
+    const auto precise_normalized = [&](vec3 value) {
+        return std::array<double, 3>{
+            static_cast<double>(value.x) * inverse_scale + bias[0],
+            static_cast<double>(value.y) * inverse_scale + bias[1],
+            static_cast<double>(value.z) * inverse_scale + bias[2]};
+    };
     const auto normalized = [&](vec3 value) {
-        return vec3{(value.x - center.x) / scale, (value.y - center.y) / scale,
-                    (value.z - center.z) / scale};
+        const auto precise = precise_normalized(value);
+        return vec3{static_cast<float>(precise[0]), static_cast<float>(precise[1]),
+                    static_cast<float>(precise[2])};
     };
     skeleton_prefix output;
     output.normalized_vertices.reserve(source.vertices.size());
-    for (const auto & value : source.vertices) output.normalized_vertices.push_back(normalized(value));
+    output.precise_normalized_vertices.reserve(source.vertices.size());
+    for (const auto & value : source.vertices) {
+        output.normalized_vertices.push_back(normalized(value));
+        output.precise_normalized_vertices.push_back(precise_normalized(value));
+    }
     output.normalized_joints.reserve(target.rest_positions.size());
     for (const auto & value : target.rest_positions) output.normalized_joints.push_back(normalized(value));
 
-    // Demo/imported meshes use upstream's "articulation" class.  Because it
-    // has no named Mixamo/VRoid part map, Order::arrange_names adds a spring
-    // marker before the first bone.  Both tokens materially condition skin
-    // generation: articulation=266, spring=260.
-    output.tokens = {257, 266, 260};
+    // Match the released executable path, including its configuration quirk:
+    // imported demo assets use class articulation=266, but TokenizerPart.parse
+    // looks for `order` while the checkpoint stores `order_config`. Its order
+    // therefore remains null and no spring/part marker is emitted. The
+    // official supplied-skeleton capture starts [257, 266, coordinates...].
+    output.tokens = {257, 266};
     std::int32_t previous = -1;
     const auto append = [&](vec3 value, std::vector<std::int32_t> & tokens) {
         tokens.push_back(discrete(value.x)); tokens.push_back(discrete(value.y)); tokens.push_back(discrete(value.z));

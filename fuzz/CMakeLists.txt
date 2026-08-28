@@ -6,3 +6,8 @@ add_executable(skintokens-glb-fuzzer glb_fuzzer.cpp)
 target_link_libraries(skintokens-glb-fuzzer PRIVATE skintokens::skintokens)
 target_compile_options(skintokens-glb-fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
 target_link_options(skintokens-glb-fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+
+add_executable(skintokens-c-api-fuzzer c_api_fuzzer.cpp)
+target_link_libraries(skintokens-c-api-fuzzer PRIVATE skintokens::skintokens)
+target_compile_options(skintokens-c-api-fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+target_link_options(skintokens-c-api-fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)

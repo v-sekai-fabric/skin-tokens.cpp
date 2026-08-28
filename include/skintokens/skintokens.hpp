@@ -95,6 +95,15 @@ struct motion {
     std::vector<quat> local_rotations; // [frame, joint]
 };
 
+struct retarget_report {
+    std::size_t isolated_cases = 0;
+    float isolated_mean_position_error = 0.0F;
+    float isolated_max_position_error = 0.0F;
+    float motion_mean_position_error = 0.0F;
+    float motion_max_position_error = 0.0F;
+    float foot_velocity_relative_error = 0.0F;
+};
+
 struct skin {
     skeleton rig;
     // Four normalized influences per source vertex, ready for glTF JOINTS_0
@@ -124,6 +133,9 @@ struct generation_options {
     std::size_t max_tokens = 2048;
     // Diagnostic integration fallback; learned TokenRig/SkinVAE is the default.
     bool geometric_only = false;
+    // Optional upstream voxel_skin heuristic. The released demo leaves this
+    // disabled by default; raw learned weights are its normal export path.
+    bool surface_postprocess = false;
 };
 
 class SKINTOKENS_API model final {
@@ -179,6 +191,28 @@ private:
 // scaled to the target rig while local rotations remain frame-exact.
 [[nodiscard]] SKINTOKENS_API result<motion> retarget_motion_to_rig(
     const motion & animation, const skeleton & target);
+
+// Builds SkinTokens' published Mixamo52 topology from an already fitted
+// SOMA30 rest rig. Body joints are mapped anatomically; SOMA's hand endpoints
+// anchor deterministic neutral finger chains.
+[[nodiscard]] SKINTOKENS_API result<skeleton> make_mixamo52_rig(
+    const skeleton & fitted_soma30);
+
+// Explicit semantic SOMA30 -> Mixamo52 transfer. Unlike the generic fallback
+// above, this never selects joints by spatial proximity.
+[[nodiscard]] SKINTOKENS_API result<motion> retarget_soma30_to_mixamo52(
+    const motion & animation, const skeleton & mixamo52);
+
+// Runs deterministic +/- joint-isolation probes and compares a complete clip
+// in root-relative normalized model space. Lower errors indicate that the
+// manual mapping preserves source joint trajectories.
+[[nodiscard]] SKINTOKENS_API result<retarget_report> validate_soma30_to_mixamo52(
+    const motion & animation, const skeleton & mixamo52);
+
+// Compares two already-exported/re-imported clips. This closes the validation
+// loop around GLB serialization instead of checking only in-memory transfer.
+[[nodiscard]] SKINTOKENS_API result<retarget_report> compare_soma30_to_mixamo52(
+    const motion & soma30_animation, const motion & mixamo52_animation);
 
 // Evaluates the same glTF linear-blend skinning transform emitted by
 // save_skinned_animation_glb_file at an exact animation frame. This is useful

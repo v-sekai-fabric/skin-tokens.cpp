@@ -16,6 +16,7 @@
 #endif
 
 #include <cstdint>
+#include <array>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -118,6 +119,7 @@ struct skeleton_prefix {
     std::vector<std::int32_t> tokens;
     std::vector<vec3> normalized_vertices;
     std::vector<vec3> normalized_joints;
+    std::vector<std::array<double, 3>> precise_normalized_vertices;
 };
 
 [[nodiscard]] result<skeleton_prefix> tokenize_skeleton_prefix(
