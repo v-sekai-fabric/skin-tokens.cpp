@@ -7,9 +7,7 @@ automatic skeleton and skin-weight generation on CPU or Vulkan.
 Skin weights say how strongly every mesh vertex follows each bone. Without
 them, moving a skeleton does not deform the character surface correctly.
 SkinTokens takes a static mesh, predicts a suitable skeleton and its vertex
-weights, and writes a portable rigged GLB. It can be used directly with an
-arbitrary mesh; neither Trellis2 nor Kimodo is required. An existing skeleton
-can also be supplied when a particular animation hierarchy must be retained.
+weights, and writes a portable rigged GLB. 
 
 ## Build and install on Linux
 
