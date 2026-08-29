@@ -56,15 +56,18 @@ int main(int argc, char ** argv) try {
     const auto reference_logits = read_values<float>(fixtures / "token-generation-logits.f32");
     if (reference_logits.size() != expected.size() * 33036U)
         throw std::runtime_error("generation logits fixture size mismatch");
-    std::vector<std::int32_t> context{prefix};
+    auto cached_logits = skintokens::detail::run_qwen_kv_trajectory(
+        **weights, (*backend)->value, mesh, prefix, expected);
+    if (!cached_logits) throw std::runtime_error(cached_logits.error().message);
+    if (cached_logits->size() != reference_logits.size())
+        throw std::runtime_error("cached generation logits shape mismatch");
     bool logits_pass = true;
     for (std::size_t step = 0; step < expected.size(); ++step) {
-        auto logits = skintokens::detail::run_qwen_logits(**weights, (*backend)->value, mesh, context);
-        if (!logits) throw std::runtime_error(logits.error().message);
         double numerator = 0.0, denominator = 0.0; float maximum = 0.0F;
         const float * reference = reference_logits.data() + step * 33036U;
+        const float * logits = cached_logits->data() + step * 33036U;
         for (std::size_t index = 0; index < 33036U; ++index) {
-            const float difference = (*logits)[index] - reference[index];
+            const float difference = logits[index] - reference[index];
             maximum = std::max(maximum, std::abs(difference));
             numerator += static_cast<double>(difference) * difference;
             denominator += static_cast<double>(reference[index]) * reference[index];
@@ -72,13 +75,12 @@ int main(int argc, char ** argv) try {
         const double relative = std::sqrt(numerator / std::max(denominator, 1e-30));
         const auto expected_top = static_cast<std::int32_t>(std::distance(reference,
             std::max_element(reference + 267, reference + 33035)));
-        const auto actual_top = static_cast<std::int32_t>(std::distance(logits->begin(),
-            std::max_element(logits->begin() + 267, logits->begin() + 33035)));
+        const auto actual_top = static_cast<std::int32_t>(std::distance(logits,
+            std::max_element(logits + 267, logits + 33035)));
         std::cout << "step_" << (step + 1U) << " max_abs=" << maximum << " rel_l2=" << relative
                   << " top=" << actual_top << " reference_top=" << expected_top << '\n';
         logits_pass = logits_pass && std::isfinite(relative) &&
             relative < (vulkan ? 0.001 : 2e-5) && maximum < (vulkan ? 0.005F : 1e-4F);
-        context.push_back(expected[step]);
     }
     for (auto & token : expected) token -= 267;
     std::cout << "expected:"; for (auto value : expected) std::cout << ' ' << value;

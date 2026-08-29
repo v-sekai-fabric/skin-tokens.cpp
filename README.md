@@ -140,12 +140,19 @@ Use `--device vulkan`, `--device cpu`, or `--device auto` at runtime.
 Set `SKINTOKENS_PROFILE=1` to print opt-in wall-clock timings for preprocessing,
 the mesh and SkinVAE encoders, TokenRig generation, binding integration, and
 model loading. TokenRig's summary also reports graph count, host/device transfer
-volume, transfer time, and synchronized graph-compute time:
+volume, transfer time, synchronized graph-compute time, and device-local KV
+cache cloning:
 
 ```sh
 SKINTOKENS_PROFILE=1 ./build/release/bin/skintokens-cli skin \
   models/SkinTokens-GGUF/F16 mesh.glb skeleton.glb result.glb --device vulkan
 ```
+
+TokenRig keeps an F32 K/V cache on the selected backend. Surviving beams retain
+their cache slots, while additional children of the same parent are cloned
+device-to-device. Cache memory therefore grows with context length and the
+configured beam count; lower `--beams` or `--max-tokens` when device memory is
+limited.
 
 ## Convert the upstream checkpoints yourself
 
@@ -313,9 +320,10 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" \
 ```
 
 The batch checker compares two different token sequences evaluated together
-against two serial evaluations. This guards the beam-batching tensor layout on
-both CPU and Vulkan; configure `SKINTOKENS_QWEN_FIXTURE_DIR` to include it in
-the opt-in CTest model suite.
+against two serial evaluations, then repeats the comparison after a shared KV
+prefill and a cloned two-child beam branch. This guards batching, cache strides,
+and beam-slot cloning on both CPU and Vulkan; configure
+`SKINTOKENS_QWEN_FIXTURE_DIR` to include it in the opt-in CTest model suite.
 
 Final binding acceptance captures normalized top-four weights and reference
 deformed vertices. The full checker runs the production GGML decoder and

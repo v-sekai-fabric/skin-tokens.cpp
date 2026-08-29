@@ -164,6 +164,18 @@ struct generated_rig_tokens {
     std::span<const std::int32_t> tokens,
     std::size_t token_count, std::size_t batch_size);
 
+[[nodiscard]] result<std::vector<float>> run_qwen_kv_trajectory(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    std::span<const std::int32_t> prefix,
+    std::span<const std::int32_t> continuation);
+
+[[nodiscard]] result<std::vector<float>> run_qwen_kv_branches(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    std::span<const std::int32_t> prefix,
+    std::span<const std::int32_t> branch_tokens);
+
 struct skeleton_prefix {
     std::vector<std::int32_t> tokens;
     std::vector<vec3> normalized_vertices;
