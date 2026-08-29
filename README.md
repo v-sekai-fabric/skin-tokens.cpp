@@ -137,6 +137,16 @@ the upstream demo's opt-in setting rather than being silently enabled.
 
 Use `--device vulkan`, `--device cpu`, or `--device auto` at runtime.
 
+Set `SKINTOKENS_PROFILE=1` to print opt-in wall-clock timings for preprocessing,
+the mesh and SkinVAE encoders, TokenRig generation, binding integration, and
+model loading. TokenRig's summary also reports graph count, host/device transfer
+volume, transfer time, and synchronized graph-compute time:
+
+```sh
+SKINTOKENS_PROFILE=1 ./build/release/bin/skintokens-cli skin \
+  models/SkinTokens-GGUF/F16 mesh.glb skeleton.glb result.glb --device vulkan
+```
+
 ## Convert the upstream checkpoints yourself
 
 This is an advanced reproducibility path; most users should download the GGUF

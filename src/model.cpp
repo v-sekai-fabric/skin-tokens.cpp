@@ -487,15 +487,19 @@ result<skin> decode_binding(const detail::weight_component & weights, ggml_backe
                             std::span<const triangle> faces,
                             std::span<const vec3> normalized_joints,
                             bool surface_postprocess) {
+    detail::profile_scope total_profile{"binding.decode.total"};
     if (codes.size() != target.names.size() * 4U)
         return std::unexpected(detail::fail(error_code::compute, "skin-code count does not match generated skeleton"));
     std::vector<std::vector<float>> dense(target.names.size());
-    for (std::size_t joint = 0; joint < target.names.size(); ++joint) {
-        auto decoded = detail::decode_skin_joint(weights, backend,
-            std::span{codes.data() + joint * 4U, 4U}, vae_condition,
-            sampled_points, sampled_normals);
-        if (!decoded) return std::unexpected(decoded.error());
-        dense[joint] = std::move(*decoded);
+    {
+        detail::profile_scope decode_profile{"binding.decode.skin_vae"};
+        for (std::size_t joint = 0; joint < target.names.size(); ++joint) {
+            auto decoded = detail::decode_skin_joint(weights, backend,
+                std::span{codes.data() + joint * 4U, 4U}, vae_condition,
+                sampled_points, sampled_normals);
+            if (!decoded) return std::unexpected(decoded.error());
+            dense[joint] = std::move(*decoded);
+        }
     }
     // Decode on the 54K cloud and interpolate to source vertices. The normal
     // upstream export retains those raw learned weights; voxel_skin is an
@@ -505,11 +509,13 @@ result<skin> decode_binding(const detail::weight_component & weights, ggml_backe
         return value != nullptr && *value != '\0';
     }();
     detail::binding_trace trace;
-    auto output = surface_postprocess ?
-        detail::integrate_postprocessed_binding(target, normalized_vertices, faces,
-            normalized_joints, sampled_points, dense, trace_binding ? &trace : nullptr) :
-        detail::integrate_learned_binding(target, normalized_vertices,
-            sampled_points, dense, trace_binding ? &trace : nullptr);
+    auto output = detail::profiled("binding.decode.cpu_integration", [&] {
+        return surface_postprocess ?
+            detail::integrate_postprocessed_binding(target, normalized_vertices, faces,
+                normalized_joints, sampled_points, dense, trace_binding ? &trace : nullptr) :
+            detail::integrate_learned_binding(target, normalized_vertices,
+                sampled_points, dense, trace_binding ? &trace : nullptr);
+    });
     dump_binding_trace_if_requested(dense, output, normalized_vertices,
                                     trace.neighbor_indices, trace.interpolation_weights,
                                     trace.surface_weights, trace.final_dense_weights);
@@ -584,6 +590,7 @@ model & model::operator=(model &&) noexcept = default;
 model::~model() = default;
 
 result<model> model::load(const std::filesystem::path & bundle, const runtime_options & options) {
+    detail::profile_scope total_profile{"model.load.total"};
     if (!std::filesystem::is_directory(bundle))
         return std::unexpected(detail::fail(error_code::io, "model bundle must be a directory"));
     auto output = std::make_unique<impl>();
@@ -621,6 +628,7 @@ result<model> model::load(const std::filesystem::path & bundle, const runtime_op
 }
 
 result<skin> model::rig(const mesh & source, const generation_options & options) const {
+    detail::profile_scope total_profile{"model.rig.total"};
     auto valid = validate_mesh(source);
     if (!valid) return std::unexpected(valid.error());
     if (options.geometric_only)
@@ -640,21 +648,33 @@ result<skin> model::rig(const mesh & source, const generation_options & options)
     for (const auto value : model_vertices)
         normalized.push_back({(value.x-center.x)/scale, (value.y-center.y)/scale, (value.z-center.z)/scale});
     auto normals = to_model_space(vertex_normals(source));
-    auto sampled = sample_mesh_surface(source, normalized, normals, options.seed);
+    auto sampled = detail::profiled("model.rig.sample_surface", [&] {
+        return sample_mesh_surface(source, normalized, normals, options.seed);
+    });
     if (!sampled) return std::unexpected(sampled.error());
-    auto mesh_queries = sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
+    auto mesh_queries = detail::profiled("model.rig.mesh_fps", [&] {
+        return sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
+    });
     dump_mesh_input_if_requested(*sampled, source.faces, mesh_queries);
-    auto mesh_condition = detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
-        sampled->points, sampled->normals, mesh_queries);
+    auto mesh_condition = detail::profiled("model.rig.mesh_encoder", [&] {
+        return detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
+            sampled->points, sampled->normals, mesh_queries);
+    });
     if (!mesh_condition) return std::unexpected(mesh_condition.error());
     dump_mesh_condition_if_requested(*mesh_condition);
-    auto vae_queries = sampled_farthest_points(sampled->points, 1536U, 384U, 1U);
-    auto vae_condition = detail::encode_skin_condition(*impl_->skin_vae_weights, impl_->backend->value,
-        sampled->points, sampled->normals, vae_queries);
+    auto vae_queries = detail::profiled("model.rig.vae_fps", [&] {
+        return sampled_farthest_points(sampled->points, 1536U, 384U, 1U);
+    });
+    auto vae_condition = detail::profiled("model.rig.vae_encoder", [&] {
+        return detail::encode_skin_condition(*impl_->skin_vae_weights, impl_->backend->value,
+            sampled->points, sampled->normals, vae_queries);
+    });
     if (!vae_condition) return std::unexpected(vae_condition.error());
     dump_vae_trace_if_requested(*sampled, vae_queries, *vae_condition);
-    auto generated = detail::generate_rig_tokens(*impl_->tokenrig_weights, impl_->backend->value,
-        *mesh_condition, options);
+    auto generated = detail::profiled("model.rig.token_generation", [&] {
+        return detail::generate_rig_tokens(*impl_->tokenrig_weights, impl_->backend->value,
+            *mesh_condition, options);
+    });
     if (!generated) return std::unexpected(generated.error());
     auto model_target = detail::detokenize_generated_skeleton(generated->skeleton_tokens, center, scale);
     if (!model_target) return std::unexpected(model_target.error());
@@ -672,6 +692,7 @@ result<skin> model::rig(const mesh & source, const generation_options & options)
 }
 
 result<skin> model::bind(const mesh & source, const skeleton & target, const generation_options & options) const {
+    detail::profile_scope total_profile{"model.bind.total"};
     auto valid_mesh = validate_mesh(source);
     if (!valid_mesh) return std::unexpected(valid_mesh.error());
     auto valid_rig = validate_skeleton(target);
@@ -680,23 +701,35 @@ result<skin> model::bind(const mesh & source, const skeleton & target, const gen
     model_source.vertices = to_model_space(source.vertices);
     model_source.normals = to_model_space(vertex_normals(source));
     const auto model_target = to_model_space(target);
-    auto prefix = detail::tokenize_skeleton_prefix(model_source, model_target);
+    auto prefix = detail::profiled("model.bind.tokenize_skeleton", [&] {
+        return detail::tokenize_skeleton_prefix(model_source, model_target);
+    });
     if (!prefix) return std::unexpected(prefix.error());
     dump_token_prefix_if_requested(prefix->tokens);
     if (options.geometric_only) return geometric_binding(source, target);
     auto normals = model_source.normals;
-    auto sampled = sample_mesh_surface(source, prefix->normalized_vertices, normals, options.seed,
-        prefix->precise_normalized_vertices);
+    auto sampled = detail::profiled("model.bind.sample_surface", [&] {
+        return sample_mesh_surface(source, prefix->normalized_vertices, normals, options.seed,
+            prefix->precise_normalized_vertices);
+    });
     if (!sampled) return std::unexpected(sampled.error());
-    auto mesh_queries = sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
+    auto mesh_queries = detail::profiled("model.bind.mesh_fps", [&] {
+        return sampled_farthest_points(sampled->points, 2048U, 512U, 0U);
+    });
     dump_mesh_input_if_requested(*sampled, source.faces, mesh_queries);
-    auto mesh_condition = detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
-        sampled->points, sampled->normals, mesh_queries);
+    auto mesh_condition = detail::profiled("model.bind.mesh_encoder", [&] {
+        return detail::encode_mesh(*impl_->mesh_weights, impl_->backend->value,
+            sampled->points, sampled->normals, mesh_queries);
+    });
     if (!mesh_condition) return std::unexpected(mesh_condition.error());
     dump_mesh_condition_if_requested(*mesh_condition);
-    auto vae_queries = sampled_farthest_points(sampled->points, 1536U, 384U, 1U);
-    auto vae_condition = detail::encode_skin_condition(*impl_->skin_vae_weights, impl_->backend->value,
-        sampled->points, sampled->normals, vae_queries);
+    auto vae_queries = detail::profiled("model.bind.vae_fps", [&] {
+        return sampled_farthest_points(sampled->points, 1536U, 384U, 1U);
+    });
+    auto vae_condition = detail::profiled("model.bind.vae_encoder", [&] {
+        return detail::encode_skin_condition(*impl_->skin_vae_weights, impl_->backend->value,
+            sampled->points, sampled->normals, vae_queries);
+    });
     if (!vae_condition) return std::unexpected(vae_condition.error());
     dump_vae_trace_if_requested(*sampled, vae_queries, *vae_condition);
     auto forced = forced_skin_codes(target.names.size());
@@ -704,8 +737,10 @@ result<skin> model::bind(const mesh & source, const skeleton & target, const gen
     std::vector<std::int32_t> codes;
     if (*forced) codes = std::move(**forced);
     else {
-        auto generated = detail::generate_skin_codes(*impl_->tokenrig_weights, impl_->backend->value,
-            *mesh_condition, prefix->tokens, target.names.size(), options);
+        auto generated = detail::profiled("model.bind.token_generation", [&] {
+            return detail::generate_skin_codes(*impl_->tokenrig_weights, impl_->backend->value,
+                *mesh_condition, prefix->tokens, target.names.size(), options);
+        });
         if (!generated) return std::unexpected(generated.error());
         codes = std::move(*generated);
     }

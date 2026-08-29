@@ -14,6 +14,57 @@ constexpr std::int64_t heads = 16;
 constexpr std::int64_t kv_heads = 8;
 constexpr std::int64_t head_dim = 128;
 
+using profile_clock = std::chrono::steady_clock;
+
+struct qwen_profile_stats {
+    std::string_view label;
+    profile_clock::time_point started = profile_clock::now();
+    double setup_ms = 0.0;
+    double host_to_device_ms = 0.0;
+    double compute_sync_ms = 0.0;
+    double device_to_host_ms = 0.0;
+    std::uint64_t host_to_device_bytes = 0U;
+    std::uint64_t device_to_host_bytes = 0U;
+    std::size_t logits_calls = 0U;
+    std::size_t layer_graphs = 0U;
+};
+
+thread_local qwen_profile_stats * active_qwen_profile = nullptr;
+
+double elapsed_ms(profile_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(profile_clock::now() - start).count();
+}
+
+class qwen_profile_session {
+public:
+    explicit qwen_profile_session(std::string_view label) : stats_{label}, previous_(active_qwen_profile) {
+        if (profiling_enabled()) active_qwen_profile = &stats_;
+    }
+    qwen_profile_session(const qwen_profile_session &) = delete;
+    qwen_profile_session & operator=(const qwen_profile_session &) = delete;
+    ~qwen_profile_session() {
+        if (!profiling_enabled()) return;
+        active_qwen_profile = previous_;
+        const double total_ms = elapsed_ms(stats_.started);
+        const double accounted = stats_.setup_ms + stats_.host_to_device_ms +
+                                 stats_.compute_sync_ms + stats_.device_to_host_ms;
+        constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+        std::fprintf(stderr,
+            "[skintokens-profile] %.*s ms=%.3f logits_calls=%zu layer_graphs=%zu "
+            "setup_ms=%.3f h2d_ms=%.3f h2d_gib=%.3f compute_sync_ms=%.3f "
+            "d2h_wait_ms=%.3f d2h_gib=%.3f cpu_other_ms=%.3f\n",
+            static_cast<int>(stats_.label.size()), stats_.label.data(), total_ms,
+            stats_.logits_calls, stats_.layer_graphs, stats_.setup_ms,
+            stats_.host_to_device_ms, static_cast<double>(stats_.host_to_device_bytes) / gib,
+            stats_.compute_sync_ms, stats_.device_to_host_ms,
+            static_cast<double>(stats_.device_to_host_bytes) / gib,
+            std::max(0.0, total_ms - accounted));
+    }
+private:
+    qwen_profile_stats stats_;
+    qwen_profile_stats * previous_;
+};
+
 ggml_tensor * required(const weight_component & weights, std::string_view name) {
     auto * value = weights.tensor(name);
     if (value == nullptr) throw std::runtime_error("missing TokenRig tensor: " + std::string{name});
@@ -52,6 +103,7 @@ std::vector<float> read_f32(ggml_tensor * tensor) {
 
 result<std::vector<float>> embed_tokens(const weight_component & weights, ggml_backend_t backend,
                                         std::span<const std::int32_t> tokens) try {
+    const auto profile_start = profile_clock::now();
     if (tokens.empty()) return std::vector<float>{};
     auto * context = ggml_init({8ULL << 20U, nullptr, true});
     if (context == nullptr) return std::unexpected(fail(error_code::allocation, "cannot create token embedding graph"));
@@ -66,10 +118,24 @@ result<std::vector<float>> embed_tokens(const weight_component & weights, ggml_b
         return std::unexpected(fail(error_code::allocation, "cannot allocate token embedding graph"));
     }
     auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    if (active_qwen_profile != nullptr) active_qwen_profile->setup_ms += elapsed_ms(profile_start);
+    auto phase_start = profile_clock::now();
     ggml_backend_tensor_set(ids, tokens.data(), 0, tokens.size_bytes());
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
+        active_qwen_profile->host_to_device_bytes += tokens.size_bytes();
+    }
+    phase_start = profile_clock::now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "token embedding graph execution failed"));
-    return read_f32(output);
+    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+    phase_start = profile_clock::now();
+    auto result = read_f32(output);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->device_to_host_ms += elapsed_ms(phase_start);
+        active_qwen_profile->device_to_host_bytes += result.size() * sizeof(float);
+    }
+    return result;
 } catch (const std::exception & exception) {
     return std::unexpected(fail(error_code::compute, exception.what()));
 }
@@ -377,6 +443,7 @@ result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_b
 result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml_backend_t backend,
                                           std::span<const float> input, std::size_t sequence,
                                           std::size_t layer) try {
+    const auto profile_start = profile_clock::now();
     if (backend == nullptr || sequence == 0U || sequence > 3192U || layer >= 28U ||
         input.size() != sequence * static_cast<std::size_t>(hidden))
         return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen layer input"));
@@ -428,17 +495,35 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
     std::vector<std::int32_t> position_values(sequence);
     for (std::size_t index = 0; index < sequence; ++index) position_values[index] = static_cast<std::int32_t>(index);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->setup_ms += elapsed_ms(profile_start);
+        ++active_qwen_profile->layer_graphs;
+    }
+    auto phase_start = profile_clock::now();
     ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
     ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(std::int32_t));
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
+        active_qwen_profile->host_to_device_bytes += input.size_bytes() + position_values.size() * sizeof(std::int32_t);
+    }
+    phase_start = profile_clock::now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "Qwen layer graph execution failed"));
-    return read_f32(output);
+    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+    phase_start = profile_clock::now();
+    auto result = read_f32(output);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->device_to_host_ms += elapsed_ms(phase_start);
+        active_qwen_profile->device_to_host_bytes += result.size() * sizeof(float);
+    }
+    return result;
 } catch (const std::exception & exception) {
     return std::unexpected(fail(error_code::compute, exception.what()));
 }
 
 result<std::vector<float>> run_qwen_head(const weight_component & weights, ggml_backend_t backend,
                                          std::span<const float> input, std::size_t sequence) try {
+    const auto profile_start = profile_clock::now();
     if (backend == nullptr || sequence == 0U || input.size() != sequence * static_cast<std::size_t>(hidden))
         return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen head input"));
     auto * context = ggml_init({16ULL << 20U, nullptr, true});
@@ -458,10 +543,24 @@ result<std::vector<float>> run_qwen_head(const weight_component & weights, ggml_
         return std::unexpected(fail(error_code::allocation, "cannot allocate Qwen head graph"));
     }
     auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
+    if (active_qwen_profile != nullptr) active_qwen_profile->setup_ms += elapsed_ms(profile_start);
+    auto phase_start = profile_clock::now();
     ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
+        active_qwen_profile->host_to_device_bytes += input.size_bytes();
+    }
+    phase_start = profile_clock::now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "Qwen head graph execution failed"));
-    return read_f32(logits);
+    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+    phase_start = profile_clock::now();
+    auto result = read_f32(logits);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->device_to_host_ms += elapsed_ms(phase_start);
+        active_qwen_profile->device_to_host_bytes += result.size() * sizeof(float);
+    }
+    return result;
 } catch (const std::exception & exception) {
     return std::unexpected(fail(error_code::compute, exception.what()));
 }
@@ -472,6 +571,7 @@ result<std::vector<float>> run_qwen_logits(const weight_component & weights, ggm
     if (backend == nullptr || mesh_embeddings.empty() ||
         mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U || tokens.empty())
         return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen logits input"));
+    if (active_qwen_profile != nullptr) ++active_qwen_profile->logits_calls;
     auto token_state = embed_tokens(weights, backend, tokens);
     if (!token_state) return std::unexpected(token_state.error());
     std::vector<float> state;
@@ -498,6 +598,7 @@ result<std::vector<std::int32_t>> generate_skin_codes(
         options.top_p > 1.0F || options.beams == 0U || options.beams > 32U ||
         !std::isfinite(options.temperature) || !std::isfinite(options.repetition_penalty))
         return std::unexpected(fail(error_code::invalid_argument, "invalid TokenRig generation input"));
+    qwen_profile_session profile{"qwen.generate_skin_codes"};
     const std::size_t wanted = joint_count * 4U;
     if (wanted > options.max_tokens)
         return std::unexpected(fail(error_code::limit_exceeded, "generation token limit is smaller than four codes per joint"));
@@ -575,6 +676,7 @@ result<generated_rig_tokens> generate_rig_tokens(
         options.beams == 0U || options.beams > 32U || options.max_tokens < 8U ||
         options.top_p < 0.0F || options.top_p > 1.0F)
         return std::unexpected(fail(error_code::invalid_argument, "invalid unconstrained TokenRig generation input"));
+    qwen_profile_session profile{"qwen.generate_rig_tokens"};
     // `articulation` is the class used by the released inference dataset.
     constexpr std::int32_t start[]{257, 266};
     constexpr std::int32_t first_skin = 267;

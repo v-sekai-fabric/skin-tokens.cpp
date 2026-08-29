@@ -17,11 +17,54 @@
 
 #include <cstdint>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace skintokens::detail {
+
+[[nodiscard]] inline bool profiling_enabled() noexcept {
+    static const bool enabled = [] {
+        const char * value = std::getenv("SKINTOKENS_PROFILE");
+        return value != nullptr && *value != '\0' && std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+inline void profile_record(std::string_view label, double milliseconds) noexcept {
+    if (!profiling_enabled()) return;
+    std::fprintf(stderr, "[skintokens-profile] %.*s ms=%.3f\n",
+                 static_cast<int>(label.size()), label.data(), milliseconds);
+}
+
+class profile_scope {
+public:
+    explicit profile_scope(std::string_view label) noexcept
+        : label_(label), start_(std::chrono::steady_clock::now()) {}
+    profile_scope(const profile_scope &) = delete;
+    profile_scope & operator=(const profile_scope &) = delete;
+    ~profile_scope() {
+        const auto elapsed = std::chrono::steady_clock::now() - start_;
+        profile_record(label_, std::chrono::duration<double, std::milli>(elapsed).count());
+    }
+private:
+    std::string_view label_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+template<class Function>
+auto profiled(std::string_view label, Function && function) {
+    const auto start = std::chrono::steady_clock::now();
+    auto output = std::forward<Function>(function)();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    profile_record(label, std::chrono::duration<double, std::milli>(elapsed).count());
+    return output;
+}
 
 [[nodiscard]] inline error fail(error_code code, std::string message) {
     return error{code, std::move(message)};
