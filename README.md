@@ -308,7 +308,14 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" \
   models/skintokens-f32 fixtures/reference-f32 cpu
 ./build/release/bin/skintokens-generation-parity \
   models/skintokens-f32 fixtures/reference-f32 cpu
+./build/release/bin/skintokens-qwen-batch-parity \
+  models/skintokens-f32 fixtures/reference-f32 cpu
 ```
+
+The batch checker compares two different token sequences evaluated together
+against two serial evaluations. This guards the beam-batching tensor layout on
+both CPU and Vulkan; configure `SKINTOKENS_QWEN_FIXTURE_DIR` to include it in
+the opt-in CTest model suite.
 
 Final binding acceptance captures normalized top-four weights and reference
 deformed vertices. The full checker runs the production GGML decoder and

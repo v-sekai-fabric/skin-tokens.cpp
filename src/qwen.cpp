@@ -26,7 +26,8 @@ struct qwen_profile_stats {
     std::uint64_t host_to_device_bytes = 0U;
     std::uint64_t device_to_host_bytes = 0U;
     std::size_t logits_calls = 0U;
-    std::size_t layer_graphs = 0U;
+    std::size_t layers = 0U;
+    std::size_t graph_computes = 0U;
 };
 
 thread_local qwen_profile_stats * active_qwen_profile = nullptr;
@@ -50,11 +51,11 @@ public:
                                  stats_.compute_sync_ms + stats_.device_to_host_ms;
         constexpr double gib = 1024.0 * 1024.0 * 1024.0;
         std::fprintf(stderr,
-            "[skintokens-profile] %.*s ms=%.3f logits_calls=%zu layer_graphs=%zu "
+            "[skintokens-profile] %.*s ms=%.3f logits_calls=%zu layers=%zu graph_computes=%zu "
             "setup_ms=%.3f h2d_ms=%.3f h2d_gib=%.3f compute_sync_ms=%.3f "
             "d2h_wait_ms=%.3f d2h_gib=%.3f cpu_other_ms=%.3f\n",
             static_cast<int>(stats_.label.size()), stats_.label.data(), total_ms,
-            stats_.logits_calls, stats_.layer_graphs, stats_.setup_ms,
+            stats_.logits_calls, stats_.layers, stats_.graph_computes, stats_.setup_ms,
             stats_.host_to_device_ms, static_cast<double>(stats_.host_to_device_bytes) / gib,
             stats_.compute_sync_ms, stats_.device_to_host_ms,
             static_cast<double>(stats_.device_to_host_bytes) / gib,
@@ -90,6 +91,56 @@ ggml_tensor * repeat_kv(ggml_context * context, ggml_tensor * value, std::int64_
     return ggml_reshape_3d(context, repeated, head_dim, heads, sequence);
 }
 
+ggml_tensor * repeat_kv_batched(ggml_context * context, ggml_tensor * value,
+                                std::int64_t sequence, std::int64_t batch) {
+    value = ggml_reshape_3d(context, value, head_dim, kv_heads, sequence * batch);
+    value = repeat_kv(context, value, sequence * batch);
+    return ggml_reshape_4d(context, value, head_dim, heads, sequence, batch);
+}
+
+ggml_tensor * qwen_layer_graph(ggml_context * context, ggml_tensor * input,
+                               ggml_tensor * positions, const weight_component & weights,
+                               std::size_t layer, std::int64_t sequence) {
+    const std::string prefix = "llm.l." + std::to_string(layer) + ".";
+    const auto get = [&](std::string_view suffix) {
+        return required(weights, prefix + std::string{suffix});
+    };
+    const auto batch = input->ne[2];
+    auto * normalized = rms(context, input, get("an.w"), 1e-6F);
+    auto * q = ggml_reshape_4d(context, linear(context, normalized, get("attn.q.w")),
+                              head_dim, heads, sequence, batch);
+    auto * k = ggml_reshape_4d(context, linear(context, normalized, get("attn.k.w")),
+                              head_dim, kv_heads, sequence, batch);
+    auto * v = ggml_reshape_4d(context, linear(context, normalized, get("attn.v.w")),
+                              head_dim, kv_heads, sequence, batch);
+    q = rms(context, q, get("attn.q_norm.w"), 1e-6F);
+    k = rms(context, k, get("attn.k_norm.w"), 1e-6F);
+    q = ggml_rope_ext(context, q, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    k = ggml_rope_ext(context, k, positions, nullptr, head_dim, GGML_ROPE_TYPE_NEOX,
+                      3192, 1'000'000.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
+    k = repeat_kv_batched(context, k, sequence, batch);
+    v = repeat_kv_batched(context, v, sequence, batch);
+    q = ggml_permute(context, q, 0, 2, 1, 3);
+    k = ggml_permute(context, k, 0, 2, 1, 3);
+    v = ggml_permute(context, v, 0, 2, 1, 3);
+    auto * scores = ggml_mul_mat(context, k, q);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_diag_mask_inf(context,
+        ggml_scale(context, scores, 1.0F / std::sqrt(static_cast<float>(head_dim))), 0);
+    auto * attended = ggml_mul_mat(context, ggml_cont(context, ggml_transpose(context, v)),
+                                   ggml_soft_max(context, scores));
+    ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
+    attended = ggml_cont(context, ggml_permute(context, attended, 0, 2, 1, 3));
+    auto * state = ggml_add(context, input, linear(context,
+        ggml_reshape_3d(context, attended, heads * head_dim, sequence, batch), get("attn.o.w")));
+    normalized = rms(context, state, get("fn.w"), 1e-6F);
+    auto * gate = ggml_silu(context, linear(context, normalized, get("mlp.g.w")));
+    auto * up = linear(context, normalized, get("mlp.u.w"));
+    return ggml_add(context, state,
+        linear(context, ggml_mul(context, gate, up), get("mlp.d.w")));
+}
+
 std::vector<float> read_f32(ggml_tensor * tensor) {
     const auto count = ggml_nelements(tensor);
     if (count < 0) throw std::runtime_error("negative GGML tensor size");
@@ -99,45 +150,6 @@ std::vector<float> read_f32(ggml_tensor * tensor) {
         return output;
     }
     throw std::runtime_error("parity snapshot unexpectedly is not F32");
-}
-
-result<std::vector<float>> embed_tokens(const weight_component & weights, ggml_backend_t backend,
-                                        std::span<const std::int32_t> tokens) try {
-    const auto profile_start = profile_clock::now();
-    if (tokens.empty()) return std::vector<float>{};
-    auto * context = ggml_init({8ULL << 20U, nullptr, true});
-    if (context == nullptr) return std::unexpected(fail(error_code::allocation, "cannot create token embedding graph"));
-    auto cleanup = std::unique_ptr<ggml_context, decltype(&ggml_free)>(context, ggml_free);
-    auto * ids = ggml_new_tensor_1d(context, GGML_TYPE_I32, static_cast<std::int64_t>(tokens.size()));
-    ggml_set_input(ids);
-    auto * output = ggml_get_rows(context, required(weights, "llm.tok.w"), ids);
-    auto * graph = ggml_new_graph_custom(context, 256, false); ggml_build_forward_expand(graph, output);
-    auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (allocator == nullptr || !ggml_gallocr_reserve(allocator, graph) || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator != nullptr) ggml_gallocr_free(allocator);
-        return std::unexpected(fail(error_code::allocation, "cannot allocate token embedding graph"));
-    }
-    auto allocator_cleanup = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>(allocator, ggml_gallocr_free);
-    if (active_qwen_profile != nullptr) active_qwen_profile->setup_ms += elapsed_ms(profile_start);
-    auto phase_start = profile_clock::now();
-    ggml_backend_tensor_set(ids, tokens.data(), 0, tokens.size_bytes());
-    if (active_qwen_profile != nullptr) {
-        active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
-        active_qwen_profile->host_to_device_bytes += tokens.size_bytes();
-    }
-    phase_start = profile_clock::now();
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
-        return std::unexpected(fail(error_code::compute, "token embedding graph execution failed"));
-    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
-    phase_start = profile_clock::now();
-    auto result = read_f32(output);
-    if (active_qwen_profile != nullptr) {
-        active_qwen_profile->device_to_host_ms += elapsed_ms(phase_start);
-        active_qwen_profile->device_to_host_bytes += result.size() * sizeof(float);
-    }
-    return result;
-} catch (const std::exception & exception) {
-    return std::unexpected(fail(error_code::compute, exception.what()));
 }
 
 std::int32_t sample_code(std::span<const float> logits, std::span<const std::int32_t> previous,
@@ -345,6 +357,152 @@ std::vector<std::pair<double, std::int32_t>> masked_candidates(
     return candidates;
 }
 
+class qwen_graph_evaluator {
+    using context_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
+    using allocator_ptr = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>;
+public:
+    qwen_graph_evaluator(const weight_component & weights, ggml_backend_t backend,
+                         std::size_t mesh_sequence, std::size_t token_count,
+                         std::size_t batch_size)
+        : backend_(backend), mesh_sequence_(mesh_sequence), token_count_(token_count),
+          batch_size_(batch_size),
+          context_(nullptr, ggml_free), allocator_(nullptr, ggml_gallocr_free) {
+        const auto profile_start = profile_clock::now();
+        const std::size_t sequence = mesh_sequence_ + token_count_;
+        if (backend_ == nullptr || mesh_sequence_ == 0U || token_count_ == 0U ||
+            batch_size_ == 0U || batch_size_ > 32U || sequence > 3192U)
+            throw std::invalid_argument("invalid full Qwen graph shape");
+        context_.reset(ggml_init({128ULL << 20U, nullptr, true}));
+        if (!context_) throw std::runtime_error("cannot create full Qwen graph context");
+        mesh_input_ = ggml_new_tensor_2d(context_.get(), GGML_TYPE_F32, hidden,
+                                         static_cast<std::int64_t>(mesh_sequence_));
+        positions_ = ggml_new_tensor_1d(context_.get(), GGML_TYPE_I32,
+                                        static_cast<std::int64_t>(sequence));
+        ggml_set_input(mesh_input_);
+        ggml_set_input(positions_);
+        ggml_tensor * token_state = nullptr;
+        for (std::size_t beam = 0; beam < batch_size_; ++beam) {
+            auto * ids = ggml_new_tensor_1d(context_.get(), GGML_TYPE_I32,
+                                            static_cast<std::int64_t>(token_count_));
+            ggml_set_input(ids);
+            token_ids_.push_back(ids);
+            auto * embedded = ggml_get_rows(context_.get(), required(weights, "llm.tok.w"), ids);
+            token_state = token_state == nullptr ? embedded :
+                ggml_concat(context_.get(), token_state, embedded, 2);
+        }
+        auto * mesh_shape = ggml_new_tensor_3d(context_.get(), GGML_TYPE_F32, hidden,
+                                               static_cast<std::int64_t>(mesh_sequence_),
+                                               static_cast<std::int64_t>(batch_size_));
+        auto * state = ggml_concat(context_.get(),
+            ggml_repeat(context_.get(), mesh_input_, mesh_shape), token_state, 1);
+        for (std::size_t layer = 0; layer < 28U; ++layer) {
+            state = qwen_layer_graph(context_.get(), state, positions_, weights, layer,
+                                     static_cast<std::int64_t>(sequence));
+        }
+        auto * final_norm = rms(context_.get(), state, required(weights, "llm.norm.w"), 1e-6F);
+        ggml_tensor * last = nullptr;
+        for (std::size_t beam = 0; beam < batch_size_; ++beam) {
+            auto * beam_last = ggml_view_2d(context_.get(), final_norm, hidden, 1,
+                final_norm->nb[1], beam * final_norm->nb[2] +
+                (sequence - 1U) * final_norm->nb[1]);
+            last = last == nullptr ? beam_last : ggml_concat(context_.get(), last, beam_last, 1);
+        }
+        logits_ = linear(context_.get(), last, required(weights, "llm.out.w"));
+        graph_ = ggml_new_graph_custom(context_.get(), 8192, false);
+        ggml_build_forward_expand(graph_, logits_);
+        allocator_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        if (!allocator_ || !ggml_gallocr_reserve(allocator_.get(), graph_) ||
+            !ggml_gallocr_alloc_graph(allocator_.get(), graph_))
+            throw std::runtime_error("cannot allocate full Qwen graph");
+        position_values_.resize(sequence);
+        for (std::size_t index = 0; index < sequence; ++index)
+            position_values_[index] = static_cast<std::int32_t>(index);
+        if (active_qwen_profile != nullptr) {
+            active_qwen_profile->layers += 28U;
+            active_qwen_profile->setup_ms += elapsed_ms(profile_start);
+        }
+    }
+
+    [[nodiscard]] std::size_t token_count() const noexcept { return token_count_; }
+    [[nodiscard]] std::size_t batch_size() const noexcept { return batch_size_; }
+
+    result<std::vector<float>> evaluate(std::span<const float> mesh_embeddings,
+                                        std::span<const std::int32_t> tokens) try {
+        if (mesh_embeddings.size() != mesh_sequence_ * static_cast<std::size_t>(hidden) ||
+            tokens.size() != token_count_ * batch_size_)
+            return std::unexpected(fail(error_code::invalid_argument, "Qwen evaluator input shape changed"));
+        if (active_qwen_profile != nullptr) ++active_qwen_profile->logits_calls;
+        auto phase_start = profile_clock::now();
+        ggml_backend_tensor_set(mesh_input_, mesh_embeddings.data(), 0, mesh_embeddings.size_bytes());
+        for (std::size_t beam = 0; beam < batch_size_; ++beam)
+            ggml_backend_tensor_set(token_ids_[beam], tokens.data() + beam * token_count_, 0,
+                                    token_count_ * sizeof(std::int32_t));
+        ggml_backend_tensor_set(positions_, position_values_.data(), 0,
+                                position_values_.size() * sizeof(std::int32_t));
+        if (active_qwen_profile != nullptr) {
+            active_qwen_profile->host_to_device_ms += elapsed_ms(phase_start);
+            active_qwen_profile->host_to_device_bytes += mesh_embeddings.size_bytes() +
+                tokens.size_bytes() + position_values_.size() * sizeof(std::int32_t);
+        }
+        phase_start = profile_clock::now();
+        if (ggml_backend_graph_compute(backend_, graph_) != GGML_STATUS_SUCCESS)
+            return std::unexpected(fail(error_code::compute, "full Qwen graph execution failed"));
+        if (active_qwen_profile != nullptr) {
+            active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+            ++active_qwen_profile->graph_computes;
+        }
+        phase_start = profile_clock::now();
+        auto result = read_f32(logits_);
+        if (active_qwen_profile != nullptr) {
+            active_qwen_profile->device_to_host_ms += elapsed_ms(phase_start);
+            active_qwen_profile->device_to_host_bytes += result.size() * sizeof(float);
+        }
+        return result;
+    } catch (const std::exception & exception) {
+        return std::unexpected(fail(error_code::compute, exception.what()));
+    }
+
+private:
+    ggml_backend_t backend_ = nullptr;
+    std::size_t mesh_sequence_ = 0U;
+    std::size_t token_count_ = 0U;
+    std::size_t batch_size_ = 0U;
+    context_ptr context_;
+    allocator_ptr allocator_;
+    ggml_tensor * mesh_input_ = nullptr;
+    std::vector<ggml_tensor *> token_ids_;
+    ggml_tensor * positions_ = nullptr;
+    ggml_tensor * logits_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    std::vector<std::int32_t> position_values_;
+};
+
+class qwen_graph_cache {
+public:
+    qwen_graph_cache(const weight_component & weights, ggml_backend_t backend,
+                     std::size_t mesh_sequence)
+        : weights_(weights), backend_(backend), mesh_sequence_(mesh_sequence) {}
+
+    result<std::vector<float>> evaluate(std::span<const float> mesh_embeddings,
+                                        std::span<const std::int32_t> tokens,
+                                        std::size_t token_count, std::size_t batch_size = 1U) try {
+        if (tokens.size() != token_count * batch_size)
+            return std::unexpected(fail(error_code::invalid_argument, "invalid batched Qwen token input"));
+        if (!evaluator_ || evaluator_->token_count() != token_count ||
+            evaluator_->batch_size() != batch_size)
+            evaluator_ = std::make_unique<qwen_graph_evaluator>(
+                weights_, backend_, mesh_sequence_, token_count, batch_size);
+        return evaluator_->evaluate(mesh_embeddings, tokens);
+    } catch (const std::exception & exception) {
+        return std::unexpected(fail(error_code::compute, exception.what()));
+    }
+private:
+    const weight_component & weights_;
+    ggml_backend_t backend_;
+    std::size_t mesh_sequence_;
+    std::unique_ptr<qwen_graph_evaluator> evaluator_;
+};
+
 } // namespace
 
 result<tensor_snapshot> run_qwen_layer0(const weight_component & weights, ggml_backend_t backend,
@@ -497,7 +655,7 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     for (std::size_t index = 0; index < sequence; ++index) position_values[index] = static_cast<std::int32_t>(index);
     if (active_qwen_profile != nullptr) {
         active_qwen_profile->setup_ms += elapsed_ms(profile_start);
-        ++active_qwen_profile->layer_graphs;
+        ++active_qwen_profile->layers;
     }
     auto phase_start = profile_clock::now();
     ggml_backend_tensor_set(x, input.data(), 0, input.size_bytes());
@@ -509,7 +667,10 @@ result<std::vector<float>> run_qwen_layer(const weight_component & weights, ggml
     phase_start = profile_clock::now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "Qwen layer graph execution failed"));
-    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+        ++active_qwen_profile->graph_computes;
+    }
     phase_start = profile_clock::now();
     auto result = read_f32(output);
     if (active_qwen_profile != nullptr) {
@@ -553,7 +714,10 @@ result<std::vector<float>> run_qwen_head(const weight_component & weights, ggml_
     phase_start = profile_clock::now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
         return std::unexpected(fail(error_code::compute, "Qwen head graph execution failed"));
-    if (active_qwen_profile != nullptr) active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+    if (active_qwen_profile != nullptr) {
+        active_qwen_profile->compute_sync_ms += elapsed_ms(phase_start);
+        ++active_qwen_profile->graph_computes;
+    }
     phase_start = profile_clock::now();
     auto result = read_f32(logits);
     if (active_qwen_profile != nullptr) {
@@ -567,26 +731,30 @@ result<std::vector<float>> run_qwen_head(const weight_component & weights, ggml_
 
 result<std::vector<float>> run_qwen_logits(const weight_component & weights, ggml_backend_t backend,
                                             std::span<const float> mesh_embeddings,
-                                            std::span<const std::int32_t> tokens) {
+                                            std::span<const std::int32_t> tokens) try {
     if (backend == nullptr || mesh_embeddings.empty() ||
         mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U || tokens.empty())
         return std::unexpected(fail(error_code::invalid_argument, "invalid Qwen logits input"));
-    if (active_qwen_profile != nullptr) ++active_qwen_profile->logits_calls;
-    auto token_state = embed_tokens(weights, backend, tokens);
-    if (!token_state) return std::unexpected(token_state.error());
-    std::vector<float> state;
-    state.reserve(mesh_embeddings.size() + token_state->size());
-    state.insert(state.end(), mesh_embeddings.begin(), mesh_embeddings.end());
-    state.insert(state.end(), token_state->begin(), token_state->end());
-    const std::size_t sequence = state.size() / static_cast<std::size_t>(hidden);
-    if (sequence > 3192U)
-        return std::unexpected(fail(error_code::limit_exceeded, "TokenRig sequence exceeds Qwen context"));
-    for (std::size_t layer = 0; layer < 28U; ++layer) {
-        auto next = run_qwen_layer(weights, backend, state, sequence, layer);
-        if (!next) return std::unexpected(next.error());
-        state = std::move(*next);
-    }
-    return run_qwen_head(weights, backend, state, sequence);
+    const std::size_t mesh_sequence = mesh_embeddings.size() / static_cast<std::size_t>(hidden);
+    qwen_graph_cache graph{weights, backend, mesh_sequence};
+    return graph.evaluate(mesh_embeddings, tokens, tokens.size());
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
+}
+
+result<std::vector<float>> run_qwen_logits_batch(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings, std::span<const std::int32_t> tokens,
+    std::size_t token_count, std::size_t batch_size) try {
+    if (backend == nullptr || mesh_embeddings.empty() ||
+        mesh_embeddings.size() % static_cast<std::size_t>(hidden) != 0U ||
+        tokens.size() != token_count * batch_size)
+        return std::unexpected(fail(error_code::invalid_argument, "invalid batched Qwen logits input"));
+    qwen_graph_cache graph{weights, backend,
+        mesh_embeddings.size() / static_cast<std::size_t>(hidden)};
+    return graph.evaluate(mesh_embeddings, tokens, token_count, batch_size);
+} catch (const std::exception & exception) {
+    return std::unexpected(fail(error_code::compute, exception.what()));
 }
 
 result<std::vector<std::int32_t>> generate_skin_codes(
@@ -599,6 +767,8 @@ result<std::vector<std::int32_t>> generate_skin_codes(
         !std::isfinite(options.temperature) || !std::isfinite(options.repetition_penalty))
         return std::unexpected(fail(error_code::invalid_argument, "invalid TokenRig generation input"));
     qwen_profile_session profile{"qwen.generate_skin_codes"};
+    qwen_graph_cache graph_cache{weights, backend,
+        mesh_embeddings.size() / static_cast<std::size_t>(hidden)};
     const std::size_t wanted = joint_count * 4U;
     if (wanted > options.max_tokens)
         return std::unexpected(fail(error_code::limit_exceeded, "generation token limit is smaller than four codes per joint"));
@@ -609,7 +779,7 @@ result<std::vector<std::int32_t>> generate_skin_codes(
         while (generated.size() < wanted) {
             std::vector<std::int32_t> tokens{skeleton_tokens.begin(), skeleton_tokens.end()};
             tokens.insert(tokens.end(), generated.begin(), generated.end());
-            auto logits = run_qwen_logits(weights, backend, mesh_embeddings, tokens);
+            auto logits = graph_cache.evaluate(mesh_embeddings, tokens, tokens.size());
             if (!logits) return std::unexpected(logits.error());
             generated.push_back(sample_code(*logits, generated, options, random));
         }
@@ -619,12 +789,24 @@ result<std::vector<std::int32_t>> generate_skin_codes(
         std::vector<beam_state> beams(1U);
         while (beams.front().tokens.size() < wanted) {
             std::vector<continuation> choices;
+            const std::size_t token_count = skeleton_tokens.size() + beams.front().tokens.size();
+            std::vector<std::int32_t> batched_tokens;
+            batched_tokens.reserve(token_count * beams.size());
             for (std::size_t beam = 0; beam < beams.size(); ++beam) {
-                std::vector<std::int32_t> tokens{skeleton_tokens.begin(), skeleton_tokens.end()};
-                tokens.insert(tokens.end(), beams[beam].tokens.begin(), beams[beam].tokens.end());
-                auto logits = run_qwen_logits(weights, backend, mesh_embeddings, tokens);
-                if (!logits) return std::unexpected(logits.error());
-                for (const auto & [score, token] : beam_candidates(*logits, beams[beam].tokens, options))
+                if (beams[beam].tokens.size() != beams.front().tokens.size())
+                    return std::unexpected(fail(error_code::compute, "beam token lengths diverged"));
+                batched_tokens.insert(batched_tokens.end(), skeleton_tokens.begin(), skeleton_tokens.end());
+                batched_tokens.insert(batched_tokens.end(), beams[beam].tokens.begin(), beams[beam].tokens.end());
+            }
+            auto logits = graph_cache.evaluate(mesh_embeddings, batched_tokens, token_count, beams.size());
+            if (!logits) return std::unexpected(logits.error());
+            constexpr std::size_t vocabulary = 33036U;
+            if (logits->size() != vocabulary * beams.size())
+                return std::unexpected(fail(error_code::compute, "batched Qwen logits shape mismatch"));
+            for (std::size_t beam = 0; beam < beams.size(); ++beam) {
+                const std::span<const float> beam_logits{
+                    logits->data() + beam * vocabulary, vocabulary};
+                for (const auto & [score, token] : beam_candidates(beam_logits, beams[beam].tokens, options))
                     choices.push_back({beam, token, beams[beam].score + score});
             }
             const std::size_t wanted_choices = std::min<std::size_t>(static_cast<std::size_t>(options.beams) * 2U, choices.size());
@@ -677,6 +859,8 @@ result<generated_rig_tokens> generate_rig_tokens(
         options.top_p < 0.0F || options.top_p > 1.0F)
         return std::unexpected(fail(error_code::invalid_argument, "invalid unconstrained TokenRig generation input"));
     qwen_profile_session profile{"qwen.generate_rig_tokens"};
+    qwen_graph_cache graph_cache{weights, backend,
+        mesh_embeddings.size() / static_cast<std::size_t>(hidden)};
     // `articulation` is the class used by the released inference dataset.
     constexpr std::int32_t start[]{257, 266};
     constexpr std::int32_t first_skin = 267;
@@ -688,7 +872,14 @@ result<generated_rig_tokens> generate_rig_tokens(
     std::mt19937_64 random{options.seed};
     for (std::size_t step = 0; step < options.max_tokens && !active.empty(); ++step) {
         std::vector<choice> choices;
+        std::vector<std::size_t> valid_beams;
+        std::vector<std::vector<std::int32_t>> allowed_by_beam;
+        std::vector<std::int32_t> batched_tokens;
+        const std::size_t token_count = active.front().tokens.size();
+        batched_tokens.reserve(token_count * active.size());
         for (std::size_t beam = 0; beam < active.size(); ++beam) {
+            if (active[beam].tokens.size() != token_count)
+                return std::unexpected(fail(error_code::compute, "beam token lengths diverged"));
             const auto skeleton_end = std::find(active[beam].tokens.begin(), active[beam].tokens.end(), 258);
             std::vector<std::int32_t> allowed;
             if (skeleton_end == active[beam].tokens.end()) {
@@ -708,9 +899,24 @@ result<generated_rig_tokens> generate_rig_tokens(
                 } else if (codes + 1U == parsed.joints * 4U) allowed.push_back(final_eos);
                 else continue;
             }
-            auto logits = run_qwen_logits(weights, backend, mesh_embeddings, active[beam].tokens);
-            if (!logits) return std::unexpected(logits.error());
-            for (const auto & [score, token] : masked_candidates(*logits, allowed, active[beam].tokens, options))
+            if (allowed.empty()) continue;
+            valid_beams.push_back(beam);
+            allowed_by_beam.push_back(std::move(allowed));
+            batched_tokens.insert(batched_tokens.end(), active[beam].tokens.begin(), active[beam].tokens.end());
+        }
+        if (valid_beams.empty()) break;
+        auto logits = graph_cache.evaluate(mesh_embeddings, batched_tokens,
+                                           token_count, valid_beams.size());
+        if (!logits) return std::unexpected(logits.error());
+        constexpr std::size_t vocabulary = 33036U;
+        if (logits->size() != vocabulary * valid_beams.size())
+            return std::unexpected(fail(error_code::compute, "batched Qwen logits shape mismatch"));
+        for (std::size_t index = 0; index < valid_beams.size(); ++index) {
+            const auto beam = valid_beams[index];
+            const std::span<const float> beam_logits{
+                logits->data() + index * vocabulary, vocabulary};
+            for (const auto & [score, token] : masked_candidates(
+                     beam_logits, allowed_by_beam[index], active[beam].tokens, options))
                 choices.push_back({beam, token, active[beam].score + score});
         }
         if (choices.empty()) break;

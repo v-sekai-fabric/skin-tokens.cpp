@@ -158,6 +158,12 @@ struct generated_rig_tokens {
     std::span<const float> mesh_embeddings,
     std::span<const std::int32_t> tokens);
 
+[[nodiscard]] result<std::vector<float>> run_qwen_logits_batch(
+    const weight_component & weights, ggml_backend_t backend,
+    std::span<const float> mesh_embeddings,
+    std::span<const std::int32_t> tokens,
+    std::size_t token_count, std::size_t batch_size);
+
 struct skeleton_prefix {
     std::vector<std::int32_t> tokens;
     std::vector<vec3> normalized_vertices;

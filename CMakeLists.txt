@@ -18,6 +18,7 @@ option(SKINTOKENS_FUZZ "Build parser fuzzers" OFF)
 set(SKINTOKENS_GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml" CACHE PATH "Pinned GGML submodule")
 set(SKINTOKENS_PARITY_MODEL_DIR "" CACHE PATH "GGUF bundle for opt-in full binding parity tests")
 set(SKINTOKENS_PARITY_FIXTURE_DIR "" CACHE PATH "Captured final upstream binding fixture")
+set(SKINTOKENS_QWEN_FIXTURE_DIR "" CACHE PATH "Captured TokenRig generation fixture")
 set(SKINTOKENS_GIRAFFE_FIXTURE_DIR "" CACHE PATH "Captured official upstream giraffe fixture")
 
 if(SKINTOKENS_SANITIZE)
@@ -178,6 +179,12 @@ target_include_directories(skintokens-logits-dump PRIVATE src include)
 target_link_libraries(skintokens-logits-dump PRIVATE ggml Threads::Threads)
 set_target_properties(skintokens-logits-dump PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+add_executable(skintokens-qwen-batch-parity
+  tools/qwen_batch_parity.cpp src/backend.cpp src/qwen.cpp src/weights.cpp)
+target_include_directories(skintokens-qwen-batch-parity PRIVATE src include)
+target_link_libraries(skintokens-qwen-batch-parity PRIVATE ggml Threads::Threads)
+set_target_properties(skintokens-qwen-batch-parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 include(CTest)
 if(SKINTOKENS_BUILD_TESTS)
   add_subdirectory(tests)
@@ -193,6 +200,20 @@ if(SKINTOKENS_BUILD_TESTS)
         "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_PARITY_FIXTURE_DIR}" vulkan)
       set_tests_properties(skintokens-final-binding-parity-vulkan PROPERTIES
         LABELS "model;parity;gpu" TIMEOUT 900)
+    endif()
+  endif()
+  if(SKINTOKENS_PARITY_MODEL_DIR AND SKINTOKENS_QWEN_FIXTURE_DIR)
+    add_test(NAME skintokens-qwen-batch-parity-cpu COMMAND
+      skintokens-qwen-batch-parity
+      "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_QWEN_FIXTURE_DIR}" cpu)
+    set_tests_properties(skintokens-qwen-batch-parity-cpu PROPERTIES
+      LABELS "model;parity;batching" TIMEOUT 900)
+    if(SKINTOKENS_ENABLE_VULKAN)
+      add_test(NAME skintokens-qwen-batch-parity-vulkan COMMAND
+        skintokens-qwen-batch-parity
+        "${SKINTOKENS_PARITY_MODEL_DIR}" "${SKINTOKENS_QWEN_FIXTURE_DIR}" vulkan)
+      set_tests_properties(skintokens-qwen-batch-parity-vulkan PROPERTIES
+        LABELS "model;parity;batching;gpu" TIMEOUT 900)
     endif()
   endif()
   if(SKINTOKENS_PARITY_MODEL_DIR AND SKINTOKENS_GIRAFFE_FIXTURE_DIR)
