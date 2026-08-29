@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -317,12 +318,6 @@ float determinant3(const matrix4 & matrix) {
     return matrix[0]*(matrix[5]*matrix[10] - matrix[9]*matrix[6]) -
            matrix[4]*(matrix[1]*matrix[10] - matrix[9]*matrix[2]) +
            matrix[8]*(matrix[1]*matrix[6] - matrix[5]*matrix[2]);
-}
-
-vec3 node_translation(const json & node) {
-    auto found = node.find("translation");
-    if (found == node.end() || !found->is_array() || found->size() != 3U) return {};
-    return {(*found)[0].get<float>(), (*found)[1].get<float>(), (*found)[2].get<float>()};
 }
 
 template<class T>
@@ -673,19 +668,39 @@ result<mesh> load_trellis_mesh_file(const std::filesystem::path & path) {
     return output;
 }
 
-result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
-    auto doc = read_document(path);
-    if (!doc) return std::unexpected(doc.error());
-    auto nodes = doc->root.find("nodes");
-    auto animations = doc->root.find("animations");
-    if (nodes == doc->root.end() || !nodes->is_array() || nodes->empty() || nodes->size() > 256U ||
-        animations == doc->root.end() || !animations->is_array() || animations->empty())
+namespace {
+
+std::string canonical_joint_name(std::string_view name) {
+    const auto colon = name.rfind(':');
+    if (colon != std::string_view::npos) name.remove_prefix(colon + 1U);
+    std::string output{name};
+    std::transform(output.begin(), output.end(), output.begin(),
+        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return output;
+}
+
+result<motion> load_skeleton_document(const document & doc, bool require_animation) {
+    auto nodes = doc.root.find("nodes");
+    auto animations = doc.root.find("animations");
+    if (nodes == doc.root.end() || !nodes->is_array() || nodes->empty() || nodes->size() > 256U)
+        return std::unexpected(detail::fail(error_code::invalid_format, "GLB has no bounded skeleton nodes"));
+    if (require_animation &&
+        (animations == doc.root.end() || !animations->is_array() || animations->empty()))
         return std::unexpected(detail::fail(error_code::invalid_format, "GLB has no bounded skeleton animation"));
+    const auto declared_skins = doc.root.find("skins");
+    const auto declared_meshes = doc.root.find("meshes");
+    const bool has_declared_skin = declared_skins != doc.root.end() && declared_skins->is_array() && !declared_skins->empty();
+    const bool has_declared_animation = animations != doc.root.end() && animations->is_array() && !animations->empty();
+    const bool has_declared_mesh = declared_meshes != doc.root.end() && declared_meshes->is_array() && !declared_meshes->empty();
+    if (!has_declared_skin && !has_declared_animation && (has_declared_mesh || nodes->size() < 2U))
+        return std::unexpected(detail::fail(error_code::invalid_format, "GLB contains no identifiable skeleton"));
     motion output;
     std::vector<std::size_t> joint_nodes;
-    const auto skins = doc->root.find("skins");
-    if (skins != doc->root.end() && skins->is_array() && !skins->empty() &&
-        (*skins)[0].contains("joints") && (*skins)[0]["joints"].is_array()) {
+    const auto skins = doc.root.find("skins");
+    if (skins != doc.root.end() && skins->is_array() && !skins->empty()) {
+        if (!(*skins)[0].is_object() || !(*skins)[0].contains("joints") ||
+            !(*skins)[0]["joints"].is_array())
+            return std::unexpected(detail::fail(error_code::invalid_format, "glTF skin has no joint array"));
         for (const auto & value : (*skins)[0]["joints"]) {
             if (!value.is_number_unsigned() || value.get<std::size_t>() >= nodes->size())
                 return std::unexpected(detail::fail(error_code::invalid_format, "skin joint node is invalid"));
@@ -722,22 +737,48 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
             }
         }
     }
-    std::vector<vec3> node_positions(nodes->size());
-    std::vector<std::uint8_t> position_state(nodes->size());
-    std::function<result<vec3>(std::size_t)> global_position = [&](std::size_t node) -> result<vec3> {
-        if (position_state[node] == 2U) return node_positions[node];
-        if (position_state[node] == 1U)
-            return std::unexpected(detail::fail(error_code::invalid_format, "skeleton hierarchy contains a cycle"));
-        position_state[node] = 1U;
-        const vec3 local = node_translation((*nodes)[node]);
-        if (node_parents[node] < 0) node_positions[node] = local;
-        else {
-            auto parent = global_position(static_cast<std::size_t>(node_parents[node]));
-            if (!parent) return std::unexpected(parent.error());
-            node_positions[node] = add(*parent, local);
+    // glTF does not require skin.joints to be topologically ordered, while
+    // TokenRig and the exported flat hierarchy require parents before
+    // children. Preserve sibling order but normalize arbitrary valid skins.
+    std::vector<std::size_t> ordered_joints;
+    ordered_joints.reserve(joint_nodes.size());
+    std::vector<bool> added(nodes->size(), false);
+    while (ordered_joints.size() != joint_nodes.size()) {
+        const auto before = ordered_joints.size();
+        for (const auto node_index : joint_nodes) {
+            if (added[node_index]) continue;
+            std::int32_t parent_node = node_parents[node_index];
+            while (parent_node >= 0 && node_to_joint[static_cast<std::size_t>(parent_node)] < 0)
+                parent_node = node_parents[static_cast<std::size_t>(parent_node)];
+            if (parent_node < 0 || added[static_cast<std::size_t>(parent_node)]) {
+                ordered_joints.push_back(node_index);
+                added[node_index] = true;
+            }
         }
-        position_state[node] = 2U;
-        return node_positions[node];
+        if (ordered_joints.size() == before)
+            return std::unexpected(detail::fail(error_code::invalid_format, "skin joint hierarchy contains a cycle"));
+    }
+    joint_nodes = std::move(ordered_joints);
+    std::fill(node_to_joint.begin(), node_to_joint.end(), -1);
+    for (std::size_t joint = 0; joint < joint_nodes.size(); ++joint)
+        node_to_joint[joint_nodes[joint]] = static_cast<std::int32_t>(joint);
+    std::vector<matrix4> node_transforms(nodes->size());
+    std::vector<std::uint8_t> transform_state(nodes->size());
+    std::function<result<matrix4>(std::size_t)> global_transform = [&](std::size_t node) -> result<matrix4> {
+        if (transform_state[node] == 2U) return node_transforms[node];
+        if (transform_state[node] == 1U)
+            return std::unexpected(detail::fail(error_code::invalid_format, "skeleton hierarchy contains a cycle"));
+        transform_state[node] = 1U;
+        auto local = node_matrix((*nodes)[node]);
+        if (!local) return std::unexpected(local.error());
+        if (node_parents[node] < 0) node_transforms[node] = *local;
+        else {
+            auto parent = global_transform(static_cast<std::size_t>(node_parents[node]));
+            if (!parent) return std::unexpected(parent.error());
+            node_transforms[node] = multiply(*parent, *local);
+        }
+        transform_state[node] = 2U;
+        return node_transforms[node];
     };
     for (std::size_t joint = 0; joint < joint_count; ++joint) {
         const std::size_t node_index = joint_nodes[joint];
@@ -746,10 +787,15 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
         while (parent_node >= 0 && node_to_joint[static_cast<std::size_t>(parent_node)] < 0)
             parent_node = node_parents[static_cast<std::size_t>(parent_node)];
         output.rig.parents[joint] = parent_node < 0 ? -1 : node_to_joint[static_cast<std::size_t>(parent_node)];
-        auto position = global_position(node_index);
-        if (!position) return std::unexpected(position.error());
-        output.rig.rest_positions[joint] = *position;
+        auto transform = global_transform(node_index);
+        if (!transform) return std::unexpected(transform.error());
+        output.rig.rest_positions[joint] = {(*transform)[12], (*transform)[13], (*transform)[14]};
     }
+    output.frames = 1U;
+    output.frames_per_second = 30.0F;
+    output.root_translations.assign(1U, output.rig.rest_positions.front());
+    output.local_rotations.assign(joint_count, {});
+    if (animations == doc.root.end() || !animations->is_array() || animations->empty()) return output;
     const auto & animation = (*animations)[0];
     auto samplers = animation.find("samplers");
     auto channels = animation.find("channels");
@@ -765,8 +811,10 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
         const auto & sampler = (*samplers)[*sampler_index];
         const auto & target = channel["target"];
         if (!sampler.contains("input") || !sampler.contains("output") || !target.contains("node") || !target.contains("path")) continue;
-        auto times = get_accessor(*doc, sampler["input"].get<std::size_t>());
-        auto values = get_accessor(*doc, sampler["output"].get<std::size_t>());
+        if (!sampler["input"].is_number_unsigned() || !sampler["output"].is_number_unsigned() ||
+            !target["node"].is_number_unsigned() || !target["path"].is_string()) continue;
+        auto times = get_accessor(doc, sampler["input"].get<std::size_t>());
+        auto values = get_accessor(doc, sampler["output"].get<std::size_t>());
         if (!times) return std::unexpected(times.error());
         if (!values) return std::unexpected(values.error());
         if (times->count != values->count || target["node"].get<std::size_t>() >= nodes->size()) continue;
@@ -780,8 +828,13 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
         }
         parsed.push_back({static_cast<std::size_t>(joint), target["path"].get<std::string>(), *times, *values});
     }
-    if (frames == 0U || frames > 100000U)
-        return std::unexpected(detail::fail(error_code::invalid_format, "animation has no bounded keyframes"));
+    if (frames > 100000U)
+        return std::unexpected(detail::fail(error_code::limit_exceeded, "animation exceeds 100000 keyframes"));
+    if (frames == 0U) {
+        if (require_animation)
+            return std::unexpected(detail::fail(error_code::invalid_format, "animation has no bounded keyframes"));
+        return output;
+    }
     output.frames = frames;
     output.frames_per_second = duration > 0.0F ? static_cast<float>(frames - 1U) / duration : 30.0F;
     output.root_translations.assign(frames, output.rig.rest_positions[0]);
@@ -798,6 +851,73 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
                 output.local_rotations[frame * joint_count + value.node] = *rotation;
             }
         }
+    }
+    return output;
+}
+
+} // namespace
+
+rig_kind identify_rig(const skeleton & value) {
+    const auto has = [&](std::string_view wanted) {
+        const auto canonical = canonical_joint_name(wanted);
+        return std::any_of(value.names.begin(), value.names.end(), [&](const std::string & name) {
+            return canonical_joint_name(name) == canonical;
+        });
+    };
+    const auto linked = [&](std::string_view child_name, std::string_view parent_name) {
+        std::size_t child = value.names.size(), parent = value.names.size();
+        const auto child_key = canonical_joint_name(child_name), parent_key = canonical_joint_name(parent_name);
+        for (std::size_t index = 0; index < value.names.size(); ++index) {
+            const auto name = canonical_joint_name(value.names[index]);
+            if (name == child_key) child = index;
+            if (name == parent_key) parent = index;
+        }
+        return child < value.parents.size() && parent < value.names.size() &&
+               value.parents[child] == static_cast<std::int32_t>(parent);
+    };
+    if (value.names.size() == 30U && has("Hips") && has("Chest") && has("LeftHandMiddleEnd") &&
+        has("RightHandMiddleEnd") && has("LeftToeBase") && has("RightToeBase") &&
+        linked("Spine1", "Hips") && linked("LeftForeArm", "LeftArm") &&
+        linked("RightForeArm", "RightArm") && linked("LeftShin", "LeftLeg") &&
+        linked("RightShin", "RightLeg")) return rig_kind::soma30;
+    if (value.names.size() == 52U && has("Hips") && has("Spine") && has("LeftHandThumb1") &&
+        has("RightHandPinky3") && has("LeftUpLeg") && has("RightToeBase") &&
+        linked("Spine", "Hips") && linked("LeftForeArm", "LeftArm") &&
+        linked("RightForeArm", "RightArm") && linked("LeftLeg", "LeftUpLeg") &&
+        linked("RightLeg", "RightUpLeg")) return rig_kind::mixamo52;
+    return rig_kind::unknown;
+}
+
+result<motion> load_skeleton_glb_file(const std::filesystem::path & path) {
+    auto doc = read_document(path);
+    if (!doc) return std::unexpected(doc.error());
+    return load_skeleton_document(*doc, false);
+}
+
+result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
+    auto doc = read_document(path);
+    if (!doc) return std::unexpected(doc.error());
+    return load_skeleton_document(*doc, true);
+}
+
+result<glb_info> inspect_glb_file(const std::filesystem::path & path) {
+    auto doc = read_document(path);
+    if (!doc) return std::unexpected(doc.error());
+    glb_info output;
+    const auto meshes = doc->root.find("meshes");
+    const auto skins = doc->root.find("skins");
+    output.has_mesh = meshes != doc->root.end() && meshes->is_array() && !meshes->empty();
+    output.has_skin = skins != doc->root.end() && skins->is_array() && !skins->empty();
+    auto skeleton = load_skeleton_document(*doc, false);
+    if (skeleton) {
+        output.has_skeleton = true;
+        output.joint_count = skeleton->rig.names.size();
+        output.frame_count = skeleton->frames;
+        output.frames_per_second = skeleton->frames_per_second;
+        output.has_animation = skeleton->frames > 1U;
+        output.rig = identify_rig(skeleton->rig);
+    } else if (output.has_skin) {
+        return std::unexpected(skeleton.error());
     }
     return output;
 }

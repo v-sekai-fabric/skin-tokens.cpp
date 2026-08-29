@@ -38,8 +38,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t * data, std::size_t siz
     const std::size_t capacity = size == 0U ? 0U : static_cast<std::size_t>(data[0] % error.size());
     st_mesh_info mesh{};
     st_motion_info motion{};
+    st_glb_info glb{};
     (void) st_inspect_mesh_file(path.string().c_str(), &mesh, error.data(), capacity);
     (void) st_inspect_motion_glb_file(path.string().c_str(), &motion, error.data(), capacity);
+    (void) st_inspect_glb_file(path.string().c_str(), &glb, error.data(), capacity);
 
     // Exercise nullability and fixed-buffer behavior across the remaining C
     // surface. GGUF/model loading is deliberately outside this fuzz target.
@@ -49,6 +51,11 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t * data, std::size_t siz
                                       capacity == 0U ? nullptr : error.data(), capacity);
     (void) st_bind_files(nullptr, path.string().c_str(), path.string().c_str(),
                          path.string().c_str(), nullptr, nullptr,
+                         capacity == 0U ? nullptr : error.data(), capacity);
+    (void) st_rig_file(nullptr, path.string().c_str(), path.string().c_str(), nullptr, nullptr,
+                       capacity == 0U ? nullptr : error.data(), capacity);
+    (void) st_skin_files(nullptr, path.string().c_str(), path.string().c_str(),
+                         path.string().c_str(), 0, nullptr, nullptr,
                          capacity == 0U ? nullptr : error.data(), capacity);
     (void) st_model_backend_name(nullptr);
     (void) st_model_last_error(nullptr);

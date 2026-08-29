@@ -44,6 +44,12 @@ typedef enum st_target_rig {
     ST_TARGET_MIXAMO52 = 2
 } st_target_rig;
 
+typedef enum st_rig_kind {
+    ST_RIG_UNKNOWN = 0,
+    ST_RIG_SOMA30 = 1,
+    ST_RIG_MIXAMO52 = 2
+} st_rig_kind;
+
 typedef struct st_runtime_options {
     st_device device;
     uint32_t threads;
@@ -74,6 +80,17 @@ typedef struct st_motion_info {
     float frames_per_second;
 } st_motion_info;
 
+typedef struct st_glb_info {
+    int has_mesh;
+    int has_skin;
+    int has_skeleton;
+    int has_animation;
+    size_t joint_count;
+    size_t frame_count;
+    float frames_per_second;
+    st_rig_kind rig_kind;
+} st_glb_info;
+
 /* Return versioned library defaults. Prefer these over zero-initialising an
  * options structure so future defaults remain source-compatible. */
 ST_API uint32_t st_abi_version(void);
@@ -93,6 +110,24 @@ ST_API st_status st_inspect_mesh_file(const char * path, st_mesh_info * output,
                                       char * error, size_t error_capacity);
 ST_API st_status st_inspect_motion_glb_file(const char * path, st_motion_info * output,
                                             char * error, size_t error_capacity);
+ST_API st_status st_inspect_glb_file(const char * path, st_glb_info * output,
+                                     char * error, size_t error_capacity);
+
+/* Generate both a skeleton and learned skin weights for an unrigged mesh. */
+ST_API st_status st_rig_file(st_model * value, const char * mesh_path,
+                             const char * output_path,
+                             const st_generation_options * options, int * learned,
+                             char * error, size_t error_capacity);
+
+/* Generate learned skin weights for a supplied armature. skeleton_path may
+ * equal mesh_path when both are stored in one GLB. Static and animated
+ * armatures are accepted. target_rig=SOMA30 preserves the supplied hierarchy;
+ * target_rig=MIXAMO52 is accepted only for a detected SOMA30 hierarchy. */
+ST_API st_status st_skin_files(st_model * value, const char * mesh_path,
+                               const char * skeleton_path, const char * output_path,
+                               int fit_skeleton_to_mesh,
+                               const st_generation_options * options, int * learned,
+                               char * error, size_t error_capacity);
 
 ST_API st_status st_bind_glb_files(st_model * value, const char * mesh_path,
                                    const char * kimodo_motion_path, const char * output_path,

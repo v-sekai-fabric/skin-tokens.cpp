@@ -95,6 +95,19 @@ struct motion {
     std::vector<quat> local_rotations; // [frame, joint]
 };
 
+enum class rig_kind : std::uint8_t { unknown, soma30, mixamo52 };
+
+struct glb_info {
+    bool has_mesh = false;
+    bool has_skin = false;
+    bool has_skeleton = false;
+    bool has_animation = false;
+    std::size_t joint_count = 0;
+    std::size_t frame_count = 0;
+    float frames_per_second = 0.0F;
+    rig_kind rig = rig_kind::unknown;
+};
+
 struct retarget_report {
     std::size_t isolated_cases = 0;
     float isolated_mean_position_error = 0.0F;
@@ -179,6 +192,17 @@ private:
 
 [[nodiscard]] SKINTOKENS_API result<motion> load_kimodo_glb_file(
     const std::filesystem::path & path);
+
+// Loads the joint hierarchy and rest pose from a glTF skin. Animation is
+// optional; static armatures are represented by one identity rest frame.
+[[nodiscard]] SKINTOKENS_API result<motion> load_skeleton_glb_file(
+    const std::filesystem::path & path);
+
+// Performs bounded structural inspection without loading model weights.
+[[nodiscard]] SKINTOKENS_API result<glb_info> inspect_glb_file(
+    const std::filesystem::path & path);
+
+[[nodiscard]] SKINTOKENS_API rig_kind identify_rig(const skeleton & value);
 
 // Uniformly fits a motion rig to the mesh's vertical extent and centre. This
 // is useful when a motion-only Kimodo skeleton and a separately generated

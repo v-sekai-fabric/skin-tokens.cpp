@@ -31,6 +31,12 @@ int main(void) {
     st_motion_info motion = {7U, 9U, 12.0F};
     assert(st_inspect_motion_glb_file(NULL, &motion, error, sizeof(error)) == ST_INVALID_ARGUMENT);
     assert(motion.frame_count == 0U && motion.joint_count == 0U && motion.frames_per_second == 0.0F);
+    st_glb_info glb = {1, 1, 1, 1, 7U, 9U, 12.0F, ST_RIG_SOMA30};
+    assert(st_inspect_glb_file(NULL, &glb, error, sizeof(error)) == ST_INVALID_ARGUMENT);
+    assert(glb.has_mesh == 0 && glb.has_skeleton == 0 && glb.joint_count == 0U);
+    assert(st_rig_file(NULL, NULL, NULL, NULL, NULL, error, sizeof(error)) == ST_INVALID_ARGUMENT);
+    assert(st_skin_files(NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                         error, sizeof(error)) == ST_INVALID_ARGUMENT);
     st_model_free(NULL);
     return 0;
 }

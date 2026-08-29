@@ -1,42 +1,97 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SkinTokens · LocalAI</title><link rel="stylesheet" href="/app.css"></head>
-<body><main>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SkinTokens · LocalAI</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main>
   <aside>
-    <header><div class="eyebrow">SKINTOKENS · GGML</div><h1><span>S</span> Bind and animate</h1>
-      <p>Import a trellis2cpp mesh and a Kimodo animation. SkinTokens predicts skin weights for the animation's fitted humanoid rig and exports an animated GLB.</p></header>
-    <section class="card">
-      <label for="meshSource">Character mesh</label><select id="meshSource"><option value="">Upload a mesh…</option></select>
-      <label class="file"><input id="mesh" type="file" accept=".glb,.t2mesh,model/gltf-binary"><b>Choose mesh GLB or T2MESH</b><small id="meshName">No upload selected</small></label>
+    <header>
+      <div class="eyebrow">SKINTOKENS · GGML</div>
+      <h1><span>S</span> Rig any mesh</h1>
+      <p>Generate a complete skeleton and skin weights, or predict new skin weights for an armature you already have.</p>
+    </header>
+
+    <fieldset class="segmented mode" aria-label="Generation mode">
+      <label><input type="radio" name="mode" value="rig" checked><span>Skeleton + skin</span></label>
+      <label><input type="radio" name="mode" value="skin"><span>Skin weights only</span></label>
+    </fieldset>
+
+    <section id="rigPanel" class="workflow">
+      <div class="card">
+        <h2>Unrigged mesh</h2>
+        <p class="hint">Upload a triangle mesh. SkinTokens will generate its skeleton and learned vertex weights.</p>
+        <label class="file"><input id="rigMesh" type="file" accept=".glb,model/gltf-binary"><b>Choose mesh GLB</b><small id="rigMeshName">No file selected</small></label>
+      </div>
     </section>
-    <section class="card">
-      <label for="motionSource">Kimodo motion</label><select id="motionSource"><option value="">Upload a motion…</option></select>
-      <label class="file"><input id="motion" type="file" accept=".glb,model/gltf-binary"><b>Choose animation GLB</b><small id="motionName">No upload selected</small></label>
+
+    <section id="skinPanel" class="workflow" hidden>
+      <fieldset class="segmented layout" aria-label="Skeleton input layout">
+        <label><input type="radio" name="layout" value="embedded" checked><span>One rigged GLB</span></label>
+        <label><input type="radio" name="layout" value="separate"><span>Separate files</span></label>
+      </fieldset>
+
+      <div id="embeddedPanel" class="card">
+        <h2>Mesh + armature</h2>
+        <p class="hint">The existing weights may be present; SkinTokens replaces them.</p>
+        <label class="file"><input id="asset" type="file" accept=".glb,model/gltf-binary"><b>Choose rigged GLB</b><small id="assetName">No file selected</small></label>
+        <div id="assetInfo" class="inspection" hidden></div>
+      </div>
+
+      <div id="separatePanel" hidden>
+        <div class="card">
+          <h2>Character mesh</h2>
+          <label class="file"><input id="skinMesh" type="file" accept=".glb,model/gltf-binary"><b>Choose mesh GLB</b><small id="skinMeshName">No file selected</small></label>
+        </div>
+        <div class="card">
+          <h2>Skeleton or animation</h2>
+          <p class="hint">Kimodo animation GLBs can be used directly.</p>
+          <label class="file"><input id="skeleton" type="file" accept=".glb,model/gltf-binary"><b>Choose skeleton GLB</b><small id="skeletonName">No file selected</small></label>
+          <div id="skeletonInfo" class="inspection" hidden></div>
+        </div>
+      </div>
+
+      <label id="retargetOption" class="check card" hidden>
+        <input id="retarget" type="checkbox">
+        <span><b>Retarget SOMA30 to Mixamo52</b><small>A SOMA30 hierarchy was detected. Leave this off to preserve it.</small></span>
+      </label>
     </section>
-    <section class="card">
-      <label for="targetRig">SkinTokens skeleton A/B</label>
-      <select id="targetRig">
-        <option value="soma30">A · SOMA30 directly</option>
-        <option value="mixamo52">B · retarget to Mixamo52</option>
-      </select>
-      <small class="hint">Both lanes use the learned existing-skeleton path. Mixamo52 uses an explicit anatomical map, not nearest-joint matching.</small>
-    </section>
+
+    <button id="generate">Generate rig</button>
+    <div id="status" class="status">Ready</div>
+    <div class="notice">Generation runs the released TokenRig and SkinVAE weights locally through GGML. Uploaded files remain in this demo's local output gallery.</div>
+
     <section class="card example" id="giraffeExample" hidden>
       <h2>Official SkinTokens giraffe</h2>
-      <p>Inspect the upstream exemplar before comparing it with humanoid bindings.</p>
+      <p>Inspect the upstream exemplar and its learned result.</p>
       <div class="example-actions">
         <button id="giraffeInput" hidden>Input mesh</button>
         <button id="giraffeResult" hidden>Learned rig</button>
       </div>
     </section>
-    <button id="bind">Bind and animate</button><div id="status" class="status">Ready</div>
-    <div class="notice">Binding runs the released TokenRig and SkinVAE weights through GGML, then applies upstream's voxel-surface locality postprocess to prevent remote bones influencing disconnected body regions. Compare direct SOMA30 conditioning with the semantically retargeted Mixamo52 topology on the same inputs.</div>
-    <section class="history"><h2>Past bindings</h2><div id="history">Loading…</div></section>
+
+    <section class="history"><h2>Past generations</h2><div id="history">Loading…</div></section>
   </aside>
-  <section class="stage"><canvas id="view"></canvas><div class="empty" id="empty">Choose a completed binding to preview it</div>
-    <div class="compare-labels" id="compareLabels" hidden><span id="meshLabel">Animated mesh</span><span id="skeletonLabel">Driving skeleton</span></div>
+
+  <section class="stage">
+    <canvas id="view"></canvas>
+    <div class="empty" id="empty">Upload a GLB or choose a completed generation</div>
+    <div class="compare-labels" id="compareLabels" hidden><span id="meshLabel">Mesh</span><span id="skeletonLabel">Skeleton</span></div>
     <div class="joint-hover" id="jointHover" hidden></div>
-    <div class="controls"><button id="play">Pause</button><button id="rest">Rest pose</button><button id="reset">Reset view</button><a id="download" download="animation.glb" hidden>Download GLB</a><input id="timeline" type="range" min="0" max="1" step=".001" value="0"><span id="time">0:00 / 0:00</span></div>
+    <div class="controls">
+      <button class="animation-control" id="play" hidden>Pause</button>
+      <button class="animation-control" id="rest" hidden>Rest pose</button>
+      <button id="reset">Reset view</button>
+      <a id="download" download="skintokens-result.glb" hidden>Download GLB</a>
+      <input class="animation-control" id="timeline" type="range" min="0" max="1" step=".001" value="0" hidden>
+      <span class="animation-control" id="time" hidden>0:00 / 0:00</span>
+    </div>
   </section>
-</main><a class="localai" href="https://localai.io" target="_blank" rel="noreferrer" aria-label="LocalAI"><img src="/localai.png" alt="LocalAI"></a>
-<script src="/app.js"></script></body></html>
+</main>
+<a class="localai" href="https://localai.io" target="_blank" rel="noreferrer" aria-label="LocalAI"><img src="/localai.png" alt="LocalAI"></a>
+<script src="/app.js"></script>
+</body>
+</html>

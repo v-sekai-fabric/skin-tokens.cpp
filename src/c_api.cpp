@@ -141,6 +141,111 @@ extern "C" st_status st_inspect_motion_glb_file(const char * path, st_motion_inf
     return fail(nullptr, ST_COMPUTE_FAILED, "unknown C++ exception", error, error_capacity);
 }
 
+extern "C" st_status st_inspect_glb_file(const char * path, st_glb_info * output,
+                                           char * error, size_t error_capacity) try {
+    if (output != nullptr) *output = {};
+    if (path == nullptr || path[0] == '\0' || output == nullptr)
+        return fail(nullptr, ST_INVALID_ARGUMENT, "GLB path and output are required", error, error_capacity);
+    auto info = skintokens::inspect_glb_file(path);
+    if (!info) return fail(nullptr, status(info.error().code), info.error().message, error, error_capacity);
+    output->has_mesh = info->has_mesh ? 1 : 0;
+    output->has_skin = info->has_skin ? 1 : 0;
+    output->has_skeleton = info->has_skeleton ? 1 : 0;
+    output->has_animation = info->has_animation ? 1 : 0;
+    output->joint_count = info->joint_count;
+    output->frame_count = info->frame_count;
+    output->frames_per_second = info->frames_per_second;
+    output->rig_kind = info->rig == skintokens::rig_kind::soma30 ? ST_RIG_SOMA30 :
+        info->rig == skintokens::rig_kind::mixamo52 ? ST_RIG_MIXAMO52 : ST_RIG_UNKNOWN;
+    copy_error({}, error, error_capacity);
+    return ST_OK;
+} catch (const std::bad_alloc &) {
+    return fail(nullptr, ST_ALLOCATION_FAILED, "allocation failed", error, error_capacity);
+} catch (const std::exception & exception) {
+    return fail(nullptr, ST_COMPUTE_FAILED, exception.what(), error, error_capacity);
+} catch (...) {
+    return fail(nullptr, ST_COMPUTE_FAILED, "unknown C++ exception", error, error_capacity);
+}
+
+extern "C" st_status st_rig_file(st_model * value, const char * mesh_path,
+                                   const char * output_path,
+                                   const st_generation_options * options, int * learned,
+                                   char * error, size_t error_capacity) try {
+    if (value == nullptr || mesh_path == nullptr || output_path == nullptr ||
+        mesh_path[0] == '\0' || output_path[0] == '\0' || !valid_generation(options))
+        return fail(value, ST_INVALID_ARGUMENT, "model, mesh, output, and valid options are required", error, error_capacity);
+    if (learned != nullptr) *learned = 0;
+    const std::filesystem::path source_path = mesh_path;
+    auto mesh = source_path.extension() == ".t2mesh" ?
+        skintokens::load_trellis_mesh_file(source_path) : skintokens::load_glb_file(source_path);
+    if (!mesh) return fail(value, status(mesh.error().code), mesh.error().message, error, error_capacity);
+    auto binding = value->value.rig(*mesh, generation(options));
+    if (!binding) return fail(value, status(binding.error().code), binding.error().message, error, error_capacity);
+    skintokens::motion rest;
+    rest.frames = 1U;
+    rest.frames_per_second = 30.0F;
+    rest.rig = binding->rig;
+    rest.root_translations.assign(1U, rest.rig.rest_positions.front());
+    rest.local_rotations.assign(rest.rig.names.size(), {});
+    auto saved = skintokens::save_skinned_animation_glb_file(output_path, *mesh, *binding, rest);
+    if (!saved) return fail(value, status(saved.error().code), saved.error().message, error, error_capacity);
+    if (learned != nullptr) *learned = binding->learned ? 1 : 0;
+    value->last_error.clear(); copy_error({}, error, error_capacity); return ST_OK;
+} catch (const std::bad_alloc &) {
+    return fail(value, ST_ALLOCATION_FAILED, "allocation failed", error, error_capacity);
+} catch (const std::exception & exception) {
+    return fail(value, ST_COMPUTE_FAILED, exception.what(), error, error_capacity);
+} catch (...) {
+    return fail(value, ST_COMPUTE_FAILED, "unknown C++ exception", error, error_capacity);
+}
+
+extern "C" st_status st_skin_files(st_model * value, const char * mesh_path,
+                                     const char * skeleton_path, const char * output_path,
+                                     int fit_skeleton_to_mesh,
+                                     const st_generation_options * options, int * learned,
+                                     char * error, size_t error_capacity) try {
+    if (value == nullptr || mesh_path == nullptr || skeleton_path == nullptr || output_path == nullptr ||
+        mesh_path[0] == '\0' || skeleton_path[0] == '\0' || output_path[0] == '\0' ||
+        (fit_skeleton_to_mesh != 0 && fit_skeleton_to_mesh != 1) || !valid_generation(options))
+        return fail(value, ST_INVALID_ARGUMENT, "model, mesh, skeleton, output, and valid options are required", error, error_capacity);
+    const auto target = options == nullptr ? ST_TARGET_SOMA30 : options->target_rig;
+    if (target == ST_TARGET_GENERATED)
+        return fail(value, ST_INVALID_ARGUMENT, "skin-only generation requires a supplied skeleton target", error, error_capacity);
+    if (learned != nullptr) *learned = 0;
+    const std::filesystem::path source_path = mesh_path;
+    auto mesh = source_path.extension() == ".t2mesh" ?
+        skintokens::load_trellis_mesh_file(source_path) : skintokens::load_glb_file(source_path);
+    if (!mesh) return fail(value, status(mesh.error().code), mesh.error().message, error, error_capacity);
+    auto motion = skintokens::load_skeleton_glb_file(skeleton_path);
+    if (!motion) return fail(value, status(motion.error().code), motion.error().message, error, error_capacity);
+    if (fit_skeleton_to_mesh != 0) {
+        auto fitted = skintokens::fit_motion_to_mesh(*mesh, *motion);
+        if (!fitted) return fail(value, status(fitted.error().code), fitted.error().message, error, error_capacity);
+        motion = std::move(fitted);
+    }
+    if (target == ST_TARGET_MIXAMO52) {
+        if (skintokens::identify_rig(motion->rig) != skintokens::rig_kind::soma30)
+            return fail(value, ST_INVALID_ARGUMENT, "Mixamo52 retargeting requires a detected SOMA30 skeleton", error, error_capacity);
+        auto mixamo = skintokens::make_mixamo52_rig(motion->rig);
+        if (!mixamo) return fail(value, status(mixamo.error().code), mixamo.error().message, error, error_capacity);
+        auto retargeted = skintokens::retarget_soma30_to_mixamo52(*motion, *mixamo);
+        if (!retargeted) return fail(value, status(retargeted.error().code), retargeted.error().message, error, error_capacity);
+        motion = std::move(retargeted);
+    }
+    auto binding = value->value.bind(*mesh, motion->rig, generation(options));
+    if (!binding) return fail(value, status(binding.error().code), binding.error().message, error, error_capacity);
+    auto saved = skintokens::save_skinned_animation_glb_file(output_path, *mesh, *binding, *motion);
+    if (!saved) return fail(value, status(saved.error().code), saved.error().message, error, error_capacity);
+    if (learned != nullptr) *learned = binding->learned ? 1 : 0;
+    value->last_error.clear(); copy_error({}, error, error_capacity); return ST_OK;
+} catch (const std::bad_alloc &) {
+    return fail(value, ST_ALLOCATION_FAILED, "allocation failed", error, error_capacity);
+} catch (const std::exception & exception) {
+    return fail(value, ST_COMPUTE_FAILED, exception.what(), error, error_capacity);
+} catch (...) {
+    return fail(value, ST_COMPUTE_FAILED, "unknown C++ exception", error, error_capacity);
+}
+
 extern "C" st_status st_bind_glb_files(st_model * value, const char * mesh_path,
                                         const char * kimodo_motion_path, const char * output_path,
                                         const st_generation_options * options, int * learned,

@@ -13,6 +13,10 @@ void usage() {
               << "  skintokens-cli rig MODEL_DIR MESH.{glb,t2mesh} OUTPUT.glb"
                  " [--device auto|cpu|vulkan] [--postprocess]"
                  " [--beams N] [--temperature F] [--max-tokens N]\n"
+              << "  skintokens-cli skin MODEL_DIR MESH.{glb,t2mesh} SKELETON.glb OUTPUT.glb"
+                 " [--device auto|cpu|vulkan] [--no-fit] [--retarget-soma-to-mixamo52]"
+                 " [--postprocess] [--beams N] [--temperature F] [--max-tokens N]\n"
+              << "  skintokens-cli glb-info FILE.glb\n"
               << "  skintokens-cli retarget-check SOMA30.glb [MIXAMO52.glb]\n"
               << "  skintokens-cli prepare-mixamo MESH.glb SOMA30.glb OUTPUT.glb\n"
               << "  skintokens-cli bind MODEL_DIR MESH.{glb,t2mesh} MOTION.glb OUTPUT.glb"
@@ -96,6 +100,22 @@ int main(int argc, char ** argv) {
         std::cout << "covered Mixamo52 comparison fixture written to " << argv[4] << '\n';
         return 0;
     }
+    if (std::string_view{argv[1]} == "glb-info") {
+        if (argc != 3) { usage(); return 2; }
+        auto info = skintokens::inspect_glb_file(argv[2]);
+        if (!info) { std::cerr << info.error().message << '\n'; return 1; }
+        const char * rig = info->rig == skintokens::rig_kind::soma30 ? "soma30" :
+            info->rig == skintokens::rig_kind::mixamo52 ? "mixamo52" : "unknown";
+        std::cout << "{\"hasMesh\":" << (info->has_mesh ? "true" : "false")
+                  << ",\"hasSkin\":" << (info->has_skin ? "true" : "false")
+                  << ",\"hasSkeleton\":" << (info->has_skeleton ? "true" : "false")
+                  << ",\"hasAnimation\":" << (info->has_animation ? "true" : "false")
+                  << ",\"jointCount\":" << info->joint_count
+                  << ",\"frameCount\":" << info->frame_count
+                  << ",\"framesPerSecond\":" << info->frames_per_second
+                  << ",\"rigKind\":\"" << rig << "\"}\n";
+        return 0;
+    }
     skintokens::runtime_options runtime;
     skintokens::generation_options generation;
     bool fit = true;
@@ -113,6 +133,10 @@ int main(int argc, char ** argv) {
             }
             supplied_skeleton = true;
         }
+        else if (std::string_view{argv[i]} == "--retarget-soma-to-mixamo52") {
+            target_rig = "mixamo52";
+            supplied_skeleton = true;
+        }
         else if (std::string_view{argv[i]} == "--no-fit") fit = false;
         else if (std::string_view{argv[i]} == "--raw-learned") generation.surface_postprocess = false;
         else if (std::string_view{argv[i]} == "--postprocess") generation.surface_postprocess = true;
@@ -125,6 +149,10 @@ int main(int argc, char ** argv) {
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--supplied-skeleton") supplied_skeleton = true;
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--raw-learned") generation.surface_postprocess = false;
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--postprocess") generation.surface_postprocess = true;
+    if (argc > 3 && std::string_view{argv[argc - 1]} == "--retarget-soma-to-mixamo52") {
+        target_rig = "mixamo52";
+        supplied_skeleton = true;
+    }
     auto model = skintokens::model::load(argv[2], runtime);
     if (!model) {
         std::cerr << model.error().message << '\n';
@@ -150,7 +178,7 @@ int main(int argc, char ** argv) {
         rest.frames = 1U;
         rest.frames_per_second = 30.0F;
         rest.rig = binding->rig;
-        rest.root_translations.assign(1U, {});
+        rest.root_translations.assign(1U, rest.rig.rest_positions.front());
         rest.local_rotations.assign(rest.rig.names.size(), {});
         auto saved = skintokens::save_skinned_animation_glb_file(
             argv[4], *geometry, *binding, rest);
@@ -158,17 +186,19 @@ int main(int argc, char ** argv) {
         std::cout << "learned skeleton and skin weights written to " << argv[4] << '\n';
         return 0;
     }
-    if (std::string_view{argv[1]} != "bind" || argc < 6) {
+    const bool skin_only = std::string_view{argv[1]} == "skin";
+    if ((!skin_only && std::string_view{argv[1]} != "bind") || argc < 6) {
         usage();
         return 2;
     }
     const std::filesystem::path mesh_path = argv[3];
     auto geometry = mesh_path.extension() == ".t2mesh" ?
         skintokens::load_trellis_mesh_file(mesh_path) : skintokens::load_glb_file(mesh_path);
-    auto animation = skintokens::load_kimodo_glb_file(argv[4]);
+    auto animation = skin_only ? skintokens::load_skeleton_glb_file(argv[4]) :
+                                 skintokens::load_kimodo_glb_file(argv[4]);
     if (!geometry) { std::cerr << geometry.error().message << '\n'; return 1; }
     if (!animation) { std::cerr << animation.error().message << '\n'; return 1; }
-    if (generation.geometric_only || supplied_skeleton) {
+    if (generation.geometric_only || supplied_skeleton || skin_only) {
       if (fit) {
         auto fitted = skintokens::fit_motion_to_mesh(*geometry, *animation);
         if (!fitted) { std::cerr << fitted.error().message << '\n'; return 1; }
@@ -176,6 +206,10 @@ int main(int argc, char ** argv) {
       }
     }
     if (target_rig == "mixamo52") {
+        if (skintokens::identify_rig(animation->rig) != skintokens::rig_kind::soma30) {
+            std::cerr << "Mixamo52 retargeting requires a detected SOMA30 skeleton\n";
+            return 1;
+        }
         auto mixamo = skintokens::make_mixamo52_rig(animation->rig);
         if (!mixamo) { std::cerr << mixamo.error().message << '\n'; return 1; }
         auto report = skintokens::validate_soma30_to_mixamo52(*animation, *mixamo);
@@ -190,10 +224,10 @@ int main(int argc, char ** argv) {
         if (!retargeted) { std::cerr << retargeted.error().message << '\n'; return 1; }
         animation = std::move(retargeted);
     }
-    skintokens::result<skintokens::skin> binding = (generation.geometric_only || supplied_skeleton) ?
+    skintokens::result<skintokens::skin> binding = (generation.geometric_only || supplied_skeleton || skin_only) ?
         model->bind(*geometry, animation->rig, generation) : model->rig(*geometry, generation);
     if (!binding) { std::cerr << binding.error().message << '\n'; return 1; }
-    if (!generation.geometric_only && !supplied_skeleton) {
+    if (!generation.geometric_only && !supplied_skeleton && !skin_only) {
         auto retargeted = skintokens::retarget_motion_to_rig(*animation, binding->rig);
         if (!retargeted) { std::cerr << retargeted.error().message << '\n'; return 1; }
         animation = std::move(retargeted);

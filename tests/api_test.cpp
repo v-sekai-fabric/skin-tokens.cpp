@@ -53,6 +53,17 @@ void write_trellis_fixture(const std::filesystem::path & path) {
     stream.write(reinterpret_cast<const char *>(indices), sizeof(indices));
 }
 
+void write_static_skeleton_fixture(const std::filesystem::path & path) {
+    std::string json = R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0,2]}],"nodes":[{"name":"Hips","translation":[0,1,0],"children":[1]},{"name":"Spine1","translation":[0,0.4,0]},{"name":"MeshNode","mesh":0,"skin":0}],"meshes":[{"primitives":[]}],"skins":[{"skeleton":0,"joints":[1,0]}]})";
+    while (json.size() % 4U) json.push_back(' ');
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    const auto write_u32 = [&](std::uint32_t value) { stream.write(reinterpret_cast<const char *>(&value), 4); };
+    write_u32(0x46546C67U); write_u32(2U);
+    write_u32(static_cast<std::uint32_t>(12U + 8U + json.size()));
+    write_u32(static_cast<std::uint32_t>(json.size())); write_u32(0x4E4F534AU);
+    stream.write(json.data(), static_cast<std::streamsize>(json.size()));
+}
+
 } // namespace
 
 int main() {
@@ -181,11 +192,27 @@ int main() {
     write_import_fixture(source);
     auto transformed = skintokens::load_glb_file(source);
     assert(transformed && transformed->vertices.size() == 3U && transformed->colors.size() == 3U);
+    auto mesh_only_info = skintokens::inspect_glb_file(source);
+    assert(mesh_only_info && mesh_only_info->has_mesh && !mesh_only_info->has_skeleton);
     assert(transformed->vertices[0].x == 2.0F && transformed->vertices[0].y == 3.0F && transformed->vertices[0].z == 4.0F);
     assert(transformed->vertices[1].x == 0.0F && transformed->vertices[2].y == 4.0F);
     assert(transformed->faces[0][0] == 0U && transformed->faces[0][1] == 2U && transformed->faces[0][2] == 1U);
     assert(transformed->colors[0].r == 1.0F && transformed->colors[1].g == 1.0F && transformed->colors[2].b == 1.0F);
     std::filesystem::remove(source);
+
+    const auto static_skeleton_path = std::filesystem::temp_directory_path() /
+        ("skintokens-static-skeleton-" + std::to_string(suffix) + ".glb");
+    write_static_skeleton_fixture(static_skeleton_path);
+    auto static_skeleton = skintokens::load_skeleton_glb_file(static_skeleton_path);
+    assert(static_skeleton && static_skeleton->frames == 1U);
+    assert(static_skeleton->rig.names.size() == 2U);
+    assert(static_skeleton->rig.names[0] == "Hips" && static_skeleton->rig.parents[1] == 0);
+    assert(close(static_skeleton->rig.rest_positions[1].y, 1.4F));
+    assert(!skintokens::load_kimodo_glb_file(static_skeleton_path));
+    auto static_info = skintokens::inspect_glb_file(static_skeleton_path);
+    assert(static_info && static_info->has_mesh && static_info->has_skin && static_info->has_skeleton);
+    assert(!static_info->has_animation && static_info->joint_count == 2U);
+    std::filesystem::remove(static_skeleton_path);
 
     const auto trellis_path = std::filesystem::temp_directory_path() /
         ("skintokens-import-" + std::to_string(suffix) + ".t2mesh");

@@ -82,6 +82,22 @@ rigging model—results are strongest on shapes resembling its training
 distribution. `--postprocess` enables the upstream surface-locality heuristic;
 omit it to preserve the raw learned weights exactly.
 
+## Generate skin weights for an existing skeleton
+
+Use `skin` when the armature already exists. A single rigged GLB can provide
+both the geometry and static or animated skeleton; its old weights are ignored:
+
+```sh
+./build/release/bin/skintokens-cli skin \
+  models/SkinTokens-GGUF/F16 \
+  character-rigged.glb character-rigged.glb character-reweighted.glb \
+  --device vulkan --no-fit --postprocess
+```
+
+Alternatively, pass separate mesh and skeleton GLBs. The default fits the
+separate skeleton to the mesh while retaining any animation. Add `--no-fit`
+when both files already share coordinates.
+
 ## Status
 
 Safe checkpoint extraction, checked GGUF loading, CPU/Vulkan backend selection,
@@ -93,11 +109,11 @@ relative L2 on CPU; Vulkan reaches `7.1e-4` for the final hidden state and
 The learned binding path runs the released Michelangelo mesh encoder, Qwen
 TokenRig policy, FSQ code expansion, condition encoder, and chunked SkinVAE
 decoder through GGML. It samples the same 54,000 surface points as upstream
-and caps dense decoder queries at 16K vertices per graph. `--supplied-skeleton` uses the
-input motion hierarchy and is the recommended Kimodo integration. Omitting it
-enables upstream's unconstrained skeleton generation, which remains
-experimental because the released policy can produce unsuitable topologies.
-`--geometric` is an explicit non-learned diagnostic.
+and caps dense decoder queries at 16K vertices per graph. The `skin` command
+uses a supplied static or animated skeleton. The `rig` command enables
+upstream's unconstrained skeleton generation, which remains experimental
+because the released policy can produce unsuitable topologies. `--geometric`
+is an explicit non-learned diagnostic.
 
 Upstream's existing-skeleton interface is deliberately generic: `--use_skeleton`
 retains an armature found in the input and generates skin only. It does not
@@ -158,22 +174,21 @@ SkinTokens:
 trellis2cpp/build/examples/mesh2glb \
   trellis-mesh.t2mesh trellis-remeshed.glb 2048 \
   --print 0.5 0.0166667 --quad 20000
-./build/release/bin/skintokens-cli bind \
+./build/release/bin/skintokens-cli skin \
   models/SkinTokens-GGUF/F16 \
   trellis-remeshed.glb kimodo-animation.glb character-animated.glb \
-  --device vulkan --supplied-skeleton
+  --device vulkan
 ```
 
-For a controlled humanoid A/B test, the direct lane above conditions on fitted
-SOMA30. The second lane builds the exact 52-joint order published in upstream's
-`configs/skeleton/mixamo.yaml`, fits its rest positions from the same SOMA
-anatomy, and uses an explicit semantic motion map:
+When the supplied skeleton is detected as SOMA30, it can optionally be
+retargeted to the 52-joint order published in upstream's
+`configs/skeleton/mixamo.yaml` using an explicit semantic motion map:
 
 ```sh
-./build/release/bin/skintokens-cli bind \
+./build/release/bin/skintokens-cli skin \
   models/SkinTokens-GGUF/F16 \
   character.glb kimodo-soma30.glb character-mixamo.glb \
-  --device vulkan --supplied-skeleton --target-rig mixamo52
+  --device vulkan --retarget-soma-to-mixamo52
 
 ./build/release/bin/skintokens-cli retarget-check kimodo-soma30.glb
 ```
@@ -181,14 +196,13 @@ anatomy, and uses an explicit semantic motion map:
 `retarget-check` rotates each mapped source joint by +/-30 degrees around all
 three axes and compares corresponding FK trajectories in normalized body
 space. It also reports full-clip joint-position and foot-velocity errors. This
-tests retargeting independently of learned skin weights; the demo's SOMA30 /
-Mixamo52 selector then tests both learned binding outcomes on identical inputs.
+tests retargeting independently of learned skin weights. Retargeting is off by
+default and appears in the demo only after strong SOMA30 detection.
 
-Both `.glb` and trellis2cpp's versioned `.t2mesh` are accepted as mesh input.
+Both `.glb` and trellis2cpp's versioned `.t2mesh` are accepted by the CLI as mesh input.
 Skinning should use the manifold-wrapped, quad-remeshed Trellis export, not its dense raw
 marching-cubes reconstruction: the latter is millions of triangles with
-generation topology that is unsuitable for animation. The demo performs this
-wrap and remesh automatically for `.t2mesh` sources. Direct quad remeshing is
+generation topology that is unsuitable for animation. Direct quad remeshing is
 not sufficient for raw reconstruction topology; Alpha Wrap must clean it first.
 GLB scene-node transforms and vertex colours are preserved; atlas textures are
 not yet round-tripped. The Kimodo rig is fitted to the mesh before
@@ -223,43 +237,43 @@ if (st_model_load("models/SkinTokens-GGUF/F16", &runtime, &model,
 }
 
 st_generation_options generation = st_default_generation_options();
-generation.target_rig = ST_TARGET_MIXAMO52;
 generation.surface_postprocess = 1;
 int learned = 0;
-st_status result = st_bind_files(model, "character.glb", "motion.glb",
-                                 "animated.glb", &generation, &learned,
+st_status result = st_skin_files(model, "character.glb", "motion.glb",
+                                 "animated.glb", 1, &generation, &learned,
                                  error, sizeof(error));
 st_model_free(model);
 ```
 
-`st_inspect_mesh_file` and `st_inspect_motion_glb_file` validate uploads without
+`st_rig_file` generates a skeleton and weights; `st_skin_files` generates
+weights for a supplied static or animated skeleton. Pass the same GLB as both
+mesh and skeleton paths for a single rigged asset. `st_inspect_glb_file`
+reports mesh, skin, skeleton, animation, and recognized-rig metadata without
 loading GGUF weights. The public parsing and error-buffer surface is exercised
 by the ASan/UBSan libFuzzer build; GGUF loading is intentionally kept outside
 that fuzzer.
 
 ## Demo
 
-The dependency-free Go/WebGL demo accepts uploaded GLBs and can scan local
-Kimodo and trellis2cpp galleries. It keeps a persistent history, runs one
-bounded worker, previews the GPU-skinned animation beside its synchronized
-driving skeleton, and offers the output GLB for download or direct reuse in
-another Three.js application.
+The dependency-free Go/WebGL demo is upload-first. Choose **Skeleton + skin**
+for an unrigged mesh, or **Skin weights only** for either one rigged GLB or
+separate mesh and skeleton GLBs. Kimodo animation GLBs work directly as the
+separate skeleton input. Playback appears only when the supplied hierarchy is
+animated; SOMA30 retargeting appears only when that rig is detected. The demo
+keeps persistent history, runs one bounded worker, visualizes joint influences,
+and exports reusable GLBs.
 
 ```sh
 cd demo
 go run . \
   --listen 127.0.0.1:8095 \
   --cli ../build/release/bin/skintokens-cli \
-  --model ../models/SkinTokens-GGUF/F16 \
-  --kimodo /path/to/kimodo/gallery \
-  --trellis /path/to/trellis/gallery \
-  --trellis-mesh2glb /path/to/trellis2cpp/mesh2glb
+  --model ../models/SkinTokens-GGUF/F16
 ```
 
 Open `http://localhost:8095`. Paths and the listen address are flags; no local
-machine paths are compiled into the C++ library or web server. The Kimodo,
-Trellis, remesher, and optional giraffe-example paths default to disabled; pass
-only the integrations available on the host.
+machine paths are compiled into the C++ library or web server. Optional
+giraffe-example paths default to disabled.
 
 ## Reference parity
 
