@@ -38,20 +38,22 @@ type glbInfo struct {
 }
 
 type record struct {
-	ID           string `json:"id"`
-	Mode         string `json:"mode"`
-	InputLayout  string `json:"inputLayout,omitempty"`
-	MeshName     string `json:"meshName"`
-	SkeletonName string `json:"skeletonName,omitempty"`
-	State        string `json:"state"`
-	Error        string `json:"error,omitempty"`
-	CreatedAt    int64  `json:"createdAt"`
-	FinishedAt   int64  `json:"finishedAt,omitempty"`
-	Learned      bool   `json:"learned"`
-	HasAnimation bool   `json:"hasAnimation"`
-	RigKind      string `json:"rigKind,omitempty"`
-	Retargeted   bool   `json:"retargeted,omitempty"`
-	OutputFile   string `json:"outputFile"`
+	ID            string `json:"id"`
+	Mode          string `json:"mode"`
+	InputLayout   string `json:"inputLayout,omitempty"`
+	MeshName      string `json:"meshName"`
+	SkeletonName  string `json:"skeletonName,omitempty"`
+	State         string `json:"state"`
+	Error         string `json:"error,omitempty"`
+	CreatedAt     int64  `json:"createdAt"`
+	FinishedAt    int64  `json:"finishedAt,omitempty"`
+	Learned       bool   `json:"learned"`
+	HasAnimation  bool   `json:"hasAnimation"`
+	RigKind       string `json:"rigKind,omitempty"`
+	Retargeted    bool   `json:"retargeted,omitempty"`
+	Postprocessed bool   `json:"postprocessed"`
+	FitMode       string `json:"fitMode"`
+	OutputFile    string `json:"outputFile"`
 
 	// Legacy fields keep existing history readable after upgrading the demo.
 	MotionName   string `json:"motionName,omitempty"`
@@ -173,13 +175,25 @@ func (s *server) worker() {
 		hasAnimation, rigKind := value.HasAnimation, value.RigKind
 		var command *exec.Cmd
 		if value.Mode == "rig" {
-			command = exec.CommandContext(ctx, s.cli, "rig", s.model, value.MeshPath, output,
-				"--device", s.device, "--postprocess")
+			arguments := []string{"rig", s.model, value.MeshPath, output, "--device", s.device}
+			if value.Postprocessed {
+				arguments = append(arguments, "--postprocess")
+			}
+			command = exec.CommandContext(ctx, s.cli, arguments...)
 		} else {
 			arguments := []string{"skin", s.model, value.MeshPath, value.SkeletonPath, output,
-				"--device", s.device, "--postprocess"}
+				"--device", s.device}
+			if value.Postprocessed {
+				arguments = append(arguments, "--postprocess")
+			}
 			if value.InputLayout == "embedded" {
-				arguments = append(arguments, "--no-fit")
+				arguments = append(arguments, "--fit", "none")
+			} else {
+				fit := value.FitMode
+				if fit != "articulated" {
+					fit = "global"
+				}
+				arguments = append(arguments, "--fit", fit)
 			}
 			if value.Retargeted {
 				arguments = append(arguments, "--retarget-soma-to-mixamo52")
@@ -287,8 +301,14 @@ func (s *server) generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	retarget := r.FormValue("retargetSomaToMixamo") == "1"
+	postprocess := r.FormValue("postprocess") == "1"
+	articulatedFit := r.FormValue("articulatedFit") == "1"
 	if mode != "skin" && retarget {
 		http.Error(w, "retargeting is available in skin-only mode", 400)
+		return
+	}
+	if articulatedFit && (mode != "skin" || layout != "separate") {
+		http.Error(w, "articulated fitting requires separate mesh and skeleton files", 400)
 		return
 	}
 
@@ -304,8 +324,16 @@ func (s *server) generate(w http.ResponseWriter, r *http.Request) {
 			_ = os.RemoveAll(directory)
 		}
 	}()
+	fitMode := "none"
+	if mode == "skin" && layout == "separate" {
+		fitMode = "global"
+		if articulatedFit {
+			fitMode = "articulated"
+		}
+	}
 	value := &record{ID: id, Mode: mode, InputLayout: layout, State: "queued",
-		CreatedAt: time.Now().UnixMilli(), Retargeted: retarget, OutputFile: "result.glb"}
+		CreatedAt: time.Now().UnixMilli(), Retargeted: retarget, Postprocessed: postprocess,
+		FitMode: fitMode, OutputFile: "result.glb"}
 	var err error
 	if mode == "rig" {
 		value.MeshPath, value.MeshName, err = oneUpload(r, "mesh", directory)
@@ -446,6 +474,15 @@ func restore(directory string) map[string]*record {
 		if json.Unmarshal(data, &value) != nil {
 			continue
 		}
+		var fields map[string]json.RawMessage
+		fitModePresent := false
+		if json.Unmarshal(data, &fields) == nil {
+			if _, present := fields["postprocessed"]; !present {
+				// Older demo versions always enabled postprocessing.
+				value.Postprocessed = true
+			}
+			_, fitModePresent = fields["fitMode"]
+		}
 		if value.Mode == "" {
 			value.Mode, value.InputLayout = "skin", "separate"
 			value.SkeletonName = value.MotionName
@@ -454,6 +491,13 @@ func restore(directory string) map[string]*record {
 		}
 		if value.OutputFile == "" {
 			value.OutputFile = "animation.glb"
+		}
+		if !fitModePresent {
+			if value.Mode == "skin" && value.InputLayout == "separate" {
+				value.FitMode = "legacy-articulated"
+			} else {
+				value.FitMode = "none"
+			}
 		}
 		if value.State == "running" || value.State == "remeshing" || value.State == "queued" {
 			value.State, value.Error = "error", "server stopped before completion"

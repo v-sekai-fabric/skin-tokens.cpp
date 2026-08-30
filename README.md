@@ -74,7 +74,7 @@ opens as a conventional skinned glTF asset:
 ./build/release/bin/skintokens-cli rig \
   models/SkinTokens-GGUF/F16 \
   character.glb character-rigged.glb \
-  --device vulkan --postprocess
+  --device vulkan
 ```
 
 The model accepts arbitrary triangle meshes, although—as with any learned
@@ -91,12 +91,29 @@ both the geometry and static or animated skeleton; its old weights are ignored:
 ./build/release/bin/skintokens-cli skin \
   models/SkinTokens-GGUF/F16 \
   character-rigged.glb character-rigged.glb character-reweighted.glb \
-  --device vulkan --no-fit --postprocess
+  --device vulkan --fit none
 ```
 
-Alternatively, pass separate mesh and skeleton GLBs. The default fits the
-separate skeleton to the mesh while retaining any animation. Add `--no-fit`
+Alternatively, pass separate mesh and skeleton GLBs. The default `--fit global`
+uses a single uniform scale and translation to match vertical extent and centre;
+it retains every relative joint position and bone-length ratio. Use `--fit none`
 when both files already share coordinates.
+
+`--fit articulated` is an explicitly experimental alternative for recognized
+humanoid arm chains. A motion-only skeleton offers two length-exact poses: its
+supplied rest pose, and its own first animation frame. This mode measures both
+against the mesh surface along the arm bones and keeps whichever actually runs
+inside the arms, so a T-pose rig driving a character generated with its arms
+lowered adopts the pose the clip already provides. Doing so also makes the bind
+pose and frame zero identical, so playback starts without warping the mesh. An
+arm chain that still misses is then posed by analytic two-bone inverse
+kinematics toward conservative mesh targets, preserving the globally scaled
+upper-arm, forearm, and hand lengths exactly. That fallback's invariant follows
+the template-skeleton embedding objective in Baran and Popovic's
+[Pinocchio](https://www.tonychai.com/072-baran.pdf), but it is deliberately a
+small pose stage rather than a copy of Pinocchio's complete LGPL rigging and
+weight-generation library. A fuller distance-field embedding implementation can
+replace this isolated stage later.
 
 ## Status
 
@@ -257,7 +274,8 @@ st_generation_options generation = st_default_generation_options();
 generation.surface_postprocess = 1;
 int learned = 0;
 st_status result = st_skin_files(model, "character.glb", "motion.glb",
-                                 "animated.glb", 1, &generation, &learned,
+                                 "animated.glb", ST_FIT_GLOBAL_SIMILARITY,
+                                 &generation, &learned,
                                  error, sizeof(error));
 st_model_free(model);
 ```
@@ -276,9 +294,10 @@ The dependency-free Go/WebGL demo is upload-first. Choose **Skeleton + skin**
 for an unrigged mesh, or **Skin weights only** for either one rigged GLB or
 separate mesh and skeleton GLBs. Kimodo animation GLBs work directly as the
 separate skeleton input. Playback appears only when the supplied hierarchy is
-animated; SOMA30 retargeting appears only when that rig is detected. The demo
-keeps persistent history, runs one bounded worker, visualizes joint influences,
-and exports reusable GLBs.
+animated. Separate inputs default to the length-preserving global fit and offer
+articulated fitting as an experimental checkbox. SOMA30 retargeting appears
+only when that rig is detected. The demo keeps persistent history, runs one
+bounded worker, visualizes joint influences, and exports reusable GLBs.
 
 ```sh
 cd demo

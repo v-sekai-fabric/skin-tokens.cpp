@@ -5,8 +5,10 @@
 #include <cstdlib>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <span>
 
 namespace skintokens {
 
@@ -65,6 +67,212 @@ quat normalized(quat value) {
                                    value.z*value.z + value.w*value.w);
     if (length <= 1e-12F) return {};
     return {value.x/length, value.y/length, value.z/length, value.w/length};
+}
+
+vec3 add(vec3 left, vec3 right) {
+    return {left.x + right.x, left.y + right.y, left.z + right.z};
+}
+
+vec3 sub(vec3 left, vec3 right) {
+    return {left.x - right.x, left.y - right.y, left.z - right.z};
+}
+
+vec3 scale(vec3 value, float factor) {
+    return {value.x * factor, value.y * factor, value.z * factor};
+}
+
+float dot(vec3 left, vec3 right) {
+    return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+vec3 cross(vec3 left, vec3 right) {
+    return {left.y * right.z - left.z * right.y,
+            left.z * right.x - left.x * right.z,
+            left.x * right.y - left.y * right.x};
+}
+
+float length(vec3 value) { return std::sqrt(dot(value, value)); }
+
+float point_segment_distance_squared(vec3 point, vec3 start, vec3 end) {
+    const auto edge = sub(end, start);
+    const float denominator = dot(edge, edge);
+    const float amount = denominator > 1.0e-12F ?
+        std::clamp(dot(sub(point, start), edge) / denominator, 0.0F, 1.0F) : 0.0F;
+    const auto delta = sub(point, add(start, scale(edge, amount)));
+    return dot(delta, delta);
+}
+
+// Closest point regions from Ericson, Real-Time Collision Detection (2005).
+float point_triangle_distance_squared(vec3 point, vec3 a, vec3 b, vec3 c) {
+    const auto ab = sub(b, a), ac = sub(c, a), ap = sub(point, a);
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0F && d2 <= 0.0F) return dot(ap, ap);
+    const auto bp = sub(point, b);
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0F && d4 <= d3) return dot(bp, bp);
+    const float vc = d1*d4 - d3*d2;
+    if (vc <= 0.0F && d1 >= 0.0F && d3 <= 0.0F) {
+        const auto delta = sub(point, add(a, scale(ab, d1 / (d1 - d3))));
+        return dot(delta, delta);
+    }
+    const auto cp = sub(point, c);
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0F && d5 <= d6) return dot(cp, cp);
+    const float vb = d5*d2 - d1*d6;
+    if (vb <= 0.0F && d2 >= 0.0F && d6 <= 0.0F) {
+        const auto delta = sub(point, add(a, scale(ac, d2 / (d2 - d6))));
+        return dot(delta, delta);
+    }
+    const float va = d3*d6 - d5*d4;
+    if (va <= 0.0F && d4 - d3 >= 0.0F && d5 - d6 >= 0.0F) {
+        const auto edge = sub(c, b);
+        const auto delta = sub(point, add(b, scale(edge, (d4 - d3) / ((d4 - d3) + (d5 - d6)))));
+        return dot(delta, delta);
+    }
+    const float denominator = va + vb + vc;
+    if (std::abs(denominator) <= 1.0e-12F)
+        return std::min({point_segment_distance_squared(point, a, b),
+                         point_segment_distance_squared(point, b, c),
+                         point_segment_distance_squared(point, c, a)});
+    const float inverse = 1.0F / denominator;
+    const auto closest = add(a, add(scale(ab, vb*inverse), scale(ac, vc*inverse)));
+    const auto delta = sub(point, closest);
+    return dot(delta, delta);
+}
+
+vec3 unit(vec3 value, vec3 fallback = {1.0F, 0.0F, 0.0F}) {
+    const float magnitude = length(value);
+    return magnitude > 1.0e-8F ? scale(value, 1.0F / magnitude) : fallback;
+}
+
+vec3 rotate(quat rotation, vec3 value) {
+    rotation = normalized(rotation);
+    const vec3 axis{rotation.x, rotation.y, rotation.z};
+    return add(add(scale(axis, 2.0F * dot(axis, value)),
+                   scale(value, rotation.w * rotation.w - dot(axis, axis))),
+               scale(cross(axis, value), 2.0F * rotation.w));
+}
+
+quat rotation_between(vec3 from, vec3 to) {
+    from = unit(from);
+    to = unit(to);
+    const float cosine = std::clamp(dot(from, to), -1.0F, 1.0F);
+    if (cosine > 1.0F - 1.0e-6F) return {};
+    if (cosine < -1.0F + 1.0e-6F) {
+        vec3 axis = cross(from, {0.0F, 1.0F, 0.0F});
+        if (length(axis) <= 1.0e-6F) axis = cross(from, {1.0F, 0.0F, 0.0F});
+        axis = unit(axis);
+        return {axis.x, axis.y, axis.z, 0.0F};
+    }
+    const auto axis = cross(from, to);
+    return normalized({axis.x, axis.y, axis.z, 1.0F + cosine});
+}
+
+struct arm_chain {
+    std::string_view shoulder;
+    std::string_view elbow;
+    std::string_view wrist;
+    float side;
+};
+
+// Canonical SMPL-X and SOMA/Mixamo arm naming. The pose search and the bounded
+// IK below both iterate this one table so they cannot disagree about which
+// chains count as arms.
+constexpr std::array<arm_chain, 4> arm_chains{{
+    {"left_shoulder", "left_elbow", "left_wrist", 1.0F},
+    {"right_shoulder", "right_elbow", "right_wrist", -1.0F},
+    {"LeftArm", "LeftForeArm", "LeftHand", 1.0F},
+    {"RightArm", "RightForeArm", "RightHand", -1.0F},
+}};
+
+std::optional<std::size_t> find_joint(const skeleton & rig, std::string_view name) {
+    const auto found = std::find(rig.names.begin(), rig.names.end(), name);
+    return found == rig.names.end() ? std::nullopt :
+        std::optional<std::size_t>{static_cast<std::size_t>(found - rig.names.begin())};
+}
+
+float surface_distance(const mesh & geometry, vec3 point) {
+    float squared = std::numeric_limits<float>::max();
+    for (const auto & face : geometry.faces)
+        squared = std::min(squared, point_triangle_distance_squared(
+            point, geometry.vertices[face[0]], geometry.vertices[face[1]], geometry.vertices[face[2]]));
+    return std::sqrt(squared);
+}
+
+// Worst distance from a bone chain to the mesh surface, sampled along every
+// segment rather than only at the joints. A straight chord between two joints
+// that both sit near the surface can still leave the volume in between, which
+// is exactly what a lowered chain beside a horizontal arm looks like.
+float chain_clearance(const mesh & geometry, std::span<const vec3> chain) {
+    constexpr unsigned steps = 4U;
+    float worst = 0.0F;
+    for (std::size_t index = 0; index + 1U < chain.size(); ++index)
+        for (unsigned step = index == 0U ? 0U : 1U; step <= steps; ++step)
+            worst = std::max(worst, surface_distance(geometry,
+                add(chain[index], scale(sub(chain[index + 1U], chain[index]),
+                    static_cast<float>(step) / static_cast<float>(steps)))));
+    return worst;
+}
+
+// Worst clearance across every recognized arm chain, or nullopt when the rig
+// exposes none: a non-humanoid skeleton must not be scored on arms it lacks.
+std::optional<float> arm_clearance(const mesh & geometry, const skeleton & rig,
+                                   const std::vector<vec3> & positions) {
+    std::optional<float> worst;
+    for (const auto & chain : arm_chains) {
+        const auto shoulder = find_joint(rig, chain.shoulder);
+        const auto elbow = find_joint(rig, chain.elbow);
+        const auto wrist = find_joint(rig, chain.wrist);
+        if (!shoulder || !elbow || !wrist) continue;
+        const std::array<vec3, 3> points{positions[*shoulder], positions[*elbow], positions[*wrist]};
+        worst = std::max(worst.value_or(0.0F), chain_clearance(geometry, points));
+    }
+    return worst;
+}
+
+// Re-expresses a clip so its rest pose is its own first frame: frame zero is
+// baked into the rest positions and every track is rebased against it. Both
+// halves are required and neither is sound alone. Rebasing by itself leaves a
+// T-pose bind driving arms-down deltas, which is what sends arms up behind the
+// head; baking by itself leaves the tracks re-applying a pose that is already
+// in the rest positions. Together they are exact: the clip replays unchanged,
+// and frame zero now equals the bind pose, so the first exported frame leaves
+// the mesh undeformed. Every bone length is a length of the source skeleton.
+motion pose_at_frame_zero(const motion & animation) {
+    const std::size_t joint_count = animation.rig.names.size();
+    motion output = animation;
+    std::vector<quat> bind_global(joint_count), frame_global(joint_count), delta_global(joint_count);
+    for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
+        const auto parent = animation.rig.parents[joint_index];
+        const quat local = animation.local_rotations[joint_index];
+        if (parent < 0) {
+            bind_global[joint_index] = normalized(local);
+            output.rig.rest_positions[joint_index] = animation.root_translations.front();
+            continue;
+        }
+        const auto index = static_cast<std::size_t>(parent);
+        bind_global[joint_index] = normalized(multiply(bind_global[index], local));
+        output.rig.rest_positions[joint_index] = add(output.rig.rest_positions[index],
+            rotate(bind_global[index], sub(animation.rig.rest_positions[joint_index],
+                                           animation.rig.rest_positions[index])));
+    }
+    for (std::size_t frame = 0; frame < animation.frames; ++frame) {
+        for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
+            const auto parent = animation.rig.parents[joint_index];
+            const quat local = animation.local_rotations[frame*joint_count+joint_index];
+            frame_global[joint_index] = normalized(parent < 0 ? local :
+                multiply(frame_global[static_cast<std::size_t>(parent)], local));
+            delta_global[joint_index] = normalized(multiply(frame_global[joint_index],
+                                                            conjugate(bind_global[joint_index])));
+        }
+        for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
+            const auto parent = animation.rig.parents[joint_index];
+            output.local_rotations[frame*joint_count+joint_index] = normalized(parent < 0 ?
+                delta_global[joint_index] : multiply(conjugate(delta_global[static_cast<std::size_t>(parent)]),
+                                                     delta_global[joint_index]));
+        }
+    }
+    return output;
 }
 
 result<void> validate_mesh(const mesh & source) {
@@ -754,7 +962,8 @@ std::string_view model::backend_name() const noexcept {
     return impl_ && impl_->backend ? std::string_view{impl_->backend->name} : std::string_view{};
 }
 
-result<motion> fit_motion_to_mesh(const mesh & geometry, const motion & animation) {
+result<motion> fit_motion_to_mesh(
+    const mesh & geometry, const motion & animation, skeleton_fit fit) {
     auto valid_mesh = validate_mesh(geometry);
     if (!valid_mesh) return std::unexpected(valid_mesh.error());
     auto valid_rig = validate_skeleton(animation.rig);
@@ -762,115 +971,192 @@ result<motion> fit_motion_to_mesh(const mesh & geometry, const motion & animatio
     if (animation.frames == 0U || animation.root_translations.size() != animation.frames ||
         animation.local_rotations.size() != animation.frames * animation.rig.names.size())
         return std::unexpected(detail::fail(error_code::invalid_argument, "motion arrays are incomplete"));
+    if (fit == skeleton_fit::none) return animation;
     vec3 mesh_low = geometry.vertices.front(), mesh_high = mesh_low;
-    vec3 rig_low = animation.rig.rest_positions.front(), rig_high = rig_low;
     const auto include = [](vec3 value, vec3 & low, vec3 & high) {
         low.x = std::min(low.x, value.x); low.y = std::min(low.y, value.y); low.z = std::min(low.z, value.z);
         high.x = std::max(high.x, value.x); high.y = std::max(high.y, value.y); high.z = std::max(high.z, value.z);
     };
     for (const auto & value : geometry.vertices) include(value, mesh_low, mesh_high);
-    for (const auto & value : animation.rig.rest_positions) include(value, rig_low, rig_high);
-    const float rig_height = rig_high.y - rig_low.y;
     const float mesh_height = mesh_high.y - mesh_low.y;
-    if (rig_height <= 1e-8F || mesh_height <= 1e-8F)
+    if (mesh_height <= 1e-8F)
         return std::unexpected(detail::fail(error_code::invalid_argument, "cannot fit degenerate mesh or skeleton bounds"));
-    const float scale = mesh_height / rig_height;
     const vec3 mesh_center{(mesh_low.x + mesh_high.x) * 0.5F, 0.0F,
                            (mesh_low.z + mesh_high.z) * 0.5F};
-    const vec3 rig_center{(rig_low.x + rig_high.x) * 0.5F, 0.0F,
-                          (rig_low.z + rig_high.z) * 0.5F};
-    const vec3 offset{mesh_center.x - rig_center.x * scale,
-                      mesh_low.y - rig_low.y * scale,
-                      mesh_center.z - rig_center.z * scale};
-    const auto transform = [&](vec3 value) {
-        return vec3{value.x * scale + offset.x, value.y * scale + offset.y,
-                    value.z * scale + offset.z};
+    // Uniform scale and translation onto the mesh's vertical extent and centre.
+    // Candidate rest poses are each placed this way before being scored, so the
+    // comparison is between poses rather than between framings.
+    struct placement { float scale; vec3 offset; };
+    const auto place = [&](const std::vector<vec3> & rest) -> std::optional<placement> {
+        vec3 low = rest.front(), high = low;
+        for (const auto & value : rest) include(value, low, high);
+        const float height = high.y - low.y;
+        if (height <= 1e-8F) return std::nullopt;
+        const float factor = mesh_height / height;
+        return placement{factor, vec3{mesh_center.x - (low.x + high.x) * 0.5F * factor,
+                                      mesh_low.y - low.y * factor,
+                                      mesh_center.z - (low.z + high.z) * 0.5F * factor}};
     };
-    motion output = animation;
+    const auto apply = [](const placement & value, vec3 point) {
+        return vec3{point.x * value.scale + value.offset.x, point.y * value.scale + value.offset.y,
+                    point.z * value.scale + value.offset.z};
+    };
+    const auto placed = [&](const placement & value, const std::vector<vec3> & rest) {
+        std::vector<vec3> result;
+        result.reserve(rest.size());
+        for (const auto & point : rest) result.push_back(apply(value, point));
+        return result;
+    };
+    motion source = animation;
+    auto chosen = place(source.rig.rest_positions);
+    if (!chosen)
+        return std::unexpected(detail::fail(error_code::invalid_argument, "cannot fit degenerate mesh or skeleton bounds"));
+    // The supplied rest pose is not the only pose the clip offers. Its own
+    // first frame is an equally length-exact pose of the same skeleton, and for
+    // a generated character it is frequently the pose the mesh was authored in.
+    // Prefer whichever of the two actually runs inside the mesh's arms, and
+    // only then fall back to the bounding-box IK further down. Global fitting
+    // keeps promising that every relative joint position is preserved, so this
+    // search stays confined to the articulated mode.
+    if (fit == skeleton_fit::articulated) {
+        auto candidate = pose_at_frame_zero(source);
+        if (const auto candidate_placement = place(candidate.rig.rest_positions)) {
+            const auto supplied_score = arm_clearance(geometry, source.rig,
+                placed(*chosen, source.rig.rest_positions));
+            const auto candidate_score = arm_clearance(geometry, candidate.rig,
+                placed(*candidate_placement, candidate.rig.rest_positions));
+            if (supplied_score && candidate_score && *candidate_score < *supplied_score) {
+                source = std::move(candidate);
+                chosen = candidate_placement;
+            }
+        }
+    }
+    const float global_scale = chosen->scale;
+    const auto transform = [&](vec3 value) { return apply(*chosen, value); };
+    motion output = source;
     for (auto & value : output.rig.rest_positions) value = transform(value);
-    // Kimodo's SMPL-X22 bind skeleton is a T-pose, while image-generated
-    // Trellis characters commonly arrive with their arms lowered. A supplied
-    // SkinTokens skeleton is expected to already lie inside its mesh, so place
-    // the two arm chains into a conservative relaxed pose before conditioning.
-    // Canonical names cover SMPL-X and SOMA. G1's neutral skeleton already
-    // has a lowered articulated arm chain and retains the uniform fit above.
-    const auto joint = [&](std::string_view name) -> std::optional<std::size_t> {
-        const auto found = std::find(output.rig.names.begin(), output.rig.names.end(), name);
-        return found == output.rig.names.end() ? std::nullopt :
-            std::optional<std::size_t>{static_cast<std::size_t>(found - output.rig.names.begin())};
-    };
-    const float mesh_width = mesh_high.x - mesh_low.x;
-    const float mesh_depth_center = (mesh_low.z + mesh_high.z) * 0.5F;
-    const auto lower_arm = [&](std::string_view shoulder_name, std::string_view elbow_name,
-                               std::string_view wrist_name, float side) {
-        const auto shoulder = joint(shoulder_name), elbow = joint(elbow_name), wrist = joint(wrist_name);
+    std::vector<quat> rest_corrections(output.rig.names.size());
+    // Optional articulated fitting follows the invariant central to automatic
+    // skeleton embedding (Baran & Popovic, SIGGRAPH 2007): pose the template,
+    // do not change its proportions. For the recognized two-bone arm chains,
+    // analytic IK reaches toward conservative mesh-box targets while retaining
+    // both globally scaled segment lengths exactly. This small bounded solver
+    // avoids pulling Pinocchio's complete LGPL rigging/weighting pipeline into
+    // the GGML runtime and can later be replaced by a fuller embedding stage.
+    const auto articulate_arm = [&](const arm_chain & chain) {
+        const auto shoulder = find_joint(output.rig, chain.shoulder);
+        const auto elbow = find_joint(output.rig, chain.elbow);
+        const auto wrist = find_joint(output.rig, chain.wrist);
         if (!shoulder || !elbow || !wrist) return;
+        const float side = chain.side;
         const auto anchor = output.rig.rest_positions[*shoulder];
-        output.rig.rest_positions[*elbow] = {
+        const auto old_elbow = output.rig.rest_positions[*elbow];
+        const auto old_wrist = output.rig.rest_positions[*wrist];
+        const float upper_length = length(sub(old_elbow, anchor));
+        const float lower_length = length(sub(old_wrist, old_elbow));
+        if (upper_length <= 1.0e-7F || lower_length <= 1.0e-7F) return;
+
+        // The pose selected above often already runs through the arm volume.
+        // Do not replace that evidence with a bounding-box guess. The test is
+        // deliberately conservative: points inside a limb stay roughly one limb
+        // radius from its surface, whereas a chain beside the arm is much
+        // farther. Sampling along the bones rather than only at the joints is
+        // what catches a chord that leaves the volume between two endpoints
+        // that both happen to sit near the surface.
+        const std::array<vec3, 3> current{anchor, old_elbow, old_wrist};
+        if (chain_clearance(geometry, current) <= mesh_height * 0.10F) return;
+
+        const float mesh_width = mesh_high.x - mesh_low.x;
+        const float mesh_depth_center = (mesh_low.z + mesh_high.z) * 0.5F;
+        const vec3 desired_elbow{
             mesh_center.x + side * mesh_width * 0.38F,
             anchor.y - mesh_height * 0.22F, mesh_depth_center};
-        const auto old_wrist = output.rig.rest_positions[*wrist];
-        const vec3 new_wrist{
+        const vec3 desired_wrist{
             mesh_center.x + side * mesh_width * 0.43F,
             anchor.y - mesh_height * 0.43F, mesh_depth_center};
+
+        const auto target_offset = sub(desired_wrist, anchor);
+        const auto direction = unit(target_offset, unit(sub(old_wrist, anchor)));
+        const float minimum_reach = std::abs(upper_length - lower_length) + 1.0e-6F;
+        // A slightly bent chain has a stable bend plane; an exactly straight
+        // chain loses that degree of freedom and flickers under tiny changes.
+        const float maximum_reach = std::max(minimum_reach, (upper_length + lower_length) * 0.98F);
+        const float reach = std::clamp(length(target_offset), minimum_reach, maximum_reach);
+        const float along = (upper_length * upper_length - lower_length * lower_length + reach * reach) /
+                            (2.0F * reach);
+        const float away = std::sqrt(std::max(0.0F, upper_length * upper_length - along * along));
+        auto bend = sub(sub(desired_elbow, anchor), scale(direction, dot(sub(desired_elbow, anchor), direction)));
+        if (length(bend) <= 1.0e-7F)
+            bend = sub(sub(old_elbow, anchor), scale(direction, dot(sub(old_elbow, anchor), direction)));
+        if (length(bend) <= 1.0e-7F) {
+            bend = cross(direction, {0.0F, 0.0F, 1.0F});
+            if (length(bend) <= 1.0e-7F) bend = cross(direction, {0.0F, 1.0F, 0.0F});
+        }
+        bend = unit(bend);
+        const vec3 new_elbow = add(anchor, add(scale(direction, along), scale(bend, away)));
+        const vec3 new_wrist = add(anchor, scale(direction, reach));
+        output.rig.rest_positions[*elbow] = new_elbow;
         output.rig.rest_positions[*wrist] = new_wrist;
-        // SOMA includes finger-tip descendants. Keep their local offsets when
-        // moving the wrist instead of stretching those terminal bones back to
-        // their original absolute locations.
-        const vec3 delta{new_wrist.x - old_wrist.x, new_wrist.y - old_wrist.y,
-                         new_wrist.z - old_wrist.z};
+        rest_corrections[*shoulder] = rotation_between(sub(old_elbow, anchor), sub(new_elbow, anchor));
+        rest_corrections[*elbow] = rotation_between(sub(old_wrist, old_elbow), sub(new_wrist, new_elbow));
+
+        // Rotate the complete hand subtree rigidly with the new forearm. This
+        // preserves every finger/end-point length instead of translating a
+        // horizontal hand onto a lowered wrist.
+        const quat hand_rotation = rotation_between(sub(old_wrist, old_elbow), sub(new_wrist, new_elbow));
+        rest_corrections[*wrist] = hand_rotation;
         for (std::size_t candidate = *wrist + 1U; candidate < output.rig.parents.size(); ++candidate) {
             auto parent = output.rig.parents[candidate];
             while (parent >= 0 && static_cast<std::size_t>(parent) != *wrist)
                 parent = output.rig.parents[static_cast<std::size_t>(parent)];
             if (parent >= 0) {
                 auto & value = output.rig.rest_positions[candidate];
-                value = {value.x + delta.x, value.y + delta.y, value.z + delta.z};
+                value = add(new_wrist, rotate(hand_rotation, sub(value, old_wrist)));
+                rest_corrections[candidate] = hand_rotation;
             }
         }
     };
-    lower_arm("left_shoulder", "left_elbow", "left_wrist", 1.0F);
-    lower_arm("right_shoulder", "right_elbow", "right_wrist", -1.0F);
-    lower_arm("LeftArm", "LeftForeArm", "LeftHand", 1.0F);
-    lower_arm("RightArm", "RightForeArm", "RightHand", -1.0F);
-    // The imported mesh has no humanoid bind-pose metadata: its static pose is
-    // the only pose to which the predicted weights can be bound.  Kimodo's
-    // quaternions, however, are absolute transforms from the SMPL-X T-pose.
-    // Convert them into hierarchy-correct global deltas from frame zero, then
-    // back into local tracks.  This makes the first animation frame identical
-    // to the fitted mesh bind pose and prevents an immediate T-pose-space warp.
-    const std::size_t joint_count = output.rig.names.size();
-    std::vector<quat> bind_global(joint_count), frame_global(joint_count), delta_global(joint_count);
-    for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
-        const auto parent = output.rig.parents[joint_index];
-        const quat local = output.local_rotations[joint_index];
-        bind_global[joint_index] = normalized(parent < 0 ? local :
-            multiply(bind_global[static_cast<std::size_t>(parent)], local));
-    }
-    for (std::size_t frame = 0; frame < output.frames; ++frame) {
-        for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
-            const auto parent = output.rig.parents[joint_index];
-            const quat local = output.local_rotations[frame*joint_count+joint_index];
-            frame_global[joint_index] = normalized(parent < 0 ? local :
-                multiply(frame_global[static_cast<std::size_t>(parent)], local));
-            delta_global[joint_index] = normalized(multiply(frame_global[joint_index],
-                                                            conjugate(bind_global[joint_index])));
-        }
-        for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
-            const auto parent = output.rig.parents[joint_index];
-            output.local_rotations[frame*joint_count+joint_index] = normalized(parent < 0 ?
-                delta_global[joint_index] : multiply(conjugate(delta_global[static_cast<std::size_t>(parent)]),
-                                                     delta_global[joint_index]));
+    if (fit == skeleton_fit::articulated) {
+        for (const auto & chain : arm_chains) articulate_arm(chain);
+        // If a parent-local rest offset changes from o to A*o, transfer the
+        // original local rotation q as A_parent*q*inverse(A_joint). This is the
+        // standard change-of-rest-frame relation. It prevents applying both
+        // the lowered rest offset and Kimodo's original arm rotation (the
+        // previous implementation effectively lowered the arm twice).
+        const std::size_t joint_count = output.rig.names.size();
+        for (std::size_t frame = 0; frame < output.frames; ++frame) {
+            for (std::size_t joint_index = 0; joint_index < joint_count; ++joint_index) {
+                const auto parent = output.rig.parents[joint_index];
+                const quat parent_correction = parent < 0 ? quat{} :
+                    rest_corrections[static_cast<std::size_t>(parent)];
+                output.local_rotations[frame*joint_count+joint_index] = normalized(multiply(
+                    multiply(parent_correction, source.local_rotations[frame*joint_count+joint_index]),
+                    conjugate(rest_corrections[joint_index])));
+            }
         }
     }
-    const vec3 first_root = animation.root_translations.front();
+    // glTF rotation channels replace a node's local rotation; Kimodo already
+    // exports the decoded motion in that exact parent-local space, and for the
+    // supplied rest pose frame zero is an ordinary animation pose rather than a
+    // bind pose. Global fitting therefore preserves every rotation verbatim.
+    // Articulated fitting only ever rewrites tracks alongside the matching rest
+    // change: the explicit rest-frame relation above, or the frame-zero bake
+    // that moved the rest positions with them. Rebasing tracks against frame
+    // zero on their own would leave a T-pose bind driving arms-down deltas,
+    // which is what produces behind-the-back and overhead arms.
+    // Uniform scale and translation do not change local rotational frames.
+    const vec3 first_root = source.root_translations.front();
     const vec3 fitted_root = output.rig.rest_positions.front();
     for (auto & value : output.root_translations) {
-        value = {fitted_root.x + (value.x - first_root.x) * scale,
-                 fitted_root.y + (value.y - first_root.y) * scale,
-                 fitted_root.z + (value.z - first_root.z) * scale};
+        value = {fitted_root.x + (value.x - first_root.x) * global_scale,
+                 fitted_root.y + (value.y - first_root.y) * global_scale,
+                 fitted_root.z + (value.z - first_root.z) * global_scale};
     }
     return output;
+}
+
+result<motion> fit_motion_to_mesh(const mesh & geometry, const motion & animation) {
+    return fit_motion_to_mesh(geometry, animation, skeleton_fit::global_similarity);
 }
 
 } // namespace skintokens

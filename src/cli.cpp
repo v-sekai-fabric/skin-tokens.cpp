@@ -3,6 +3,7 @@
 #include <iostream>
 #include <filesystem>
 #include <iomanip>
+#include <stdexcept>
 #include <string_view>
 
 namespace {
@@ -14,13 +15,15 @@ void usage() {
                  " [--device auto|cpu|vulkan] [--postprocess]"
                  " [--beams N] [--temperature F] [--max-tokens N]\n"
               << "  skintokens-cli skin MODEL_DIR MESH.{glb,t2mesh} SKELETON.glb OUTPUT.glb"
-                 " [--device auto|cpu|vulkan] [--no-fit] [--retarget-soma-to-mixamo52]"
+                 " [--device auto|cpu|vulkan] [--fit none|global|articulated]"
+                 " [--retarget-soma-to-mixamo52]"
                  " [--postprocess] [--beams N] [--temperature F] [--max-tokens N]\n"
               << "  skintokens-cli glb-info FILE.glb\n"
               << "  skintokens-cli retarget-check SOMA30.glb [MIXAMO52.glb]\n"
               << "  skintokens-cli prepare-mixamo MESH.glb SOMA30.glb OUTPUT.glb\n"
               << "  skintokens-cli bind MODEL_DIR MESH.{glb,t2mesh} MOTION.glb OUTPUT.glb"
-                 " [--device auto|cpu|vulkan] [--geometric|--supplied-skeleton] [--no-fit]"
+                 " [--device auto|cpu|vulkan] [--geometric|--supplied-skeleton]"
+                 " [--fit none|global|articulated]"
                  " [--target-rig soma30|mixamo52]"
                  " [--postprocess]"
                  " [--beams N] [--temperature F] [--max-tokens N]\n";
@@ -30,6 +33,13 @@ skintokens::device_kind parse_device(std::string_view value) {
     if (value == "cpu") return skintokens::device_kind::cpu;
     if (value == "vulkan") return skintokens::device_kind::vulkan;
     return skintokens::device_kind::automatic;
+}
+
+skintokens::skeleton_fit parse_fit(std::string_view value) {
+    if (value == "none") return skintokens::skeleton_fit::none;
+    if (value == "articulated") return skintokens::skeleton_fit::articulated;
+    if (value == "global") return skintokens::skeleton_fit::global_similarity;
+    throw std::invalid_argument("fit must be none, global, or articulated");
 }
 
 } // namespace
@@ -118,7 +128,7 @@ int main(int argc, char ** argv) {
     }
     skintokens::runtime_options runtime;
     skintokens::generation_options generation;
-    bool fit = true;
+    auto fit = skintokens::skeleton_fit::global_similarity;
     bool supplied_skeleton = false;
     std::string_view target_rig = "soma30";
     for (int i = 3; i + 1 < argc; ++i) {
@@ -137,7 +147,11 @@ int main(int argc, char ** argv) {
             target_rig = "mixamo52";
             supplied_skeleton = true;
         }
-        else if (std::string_view{argv[i]} == "--no-fit") fit = false;
+        else if (std::string_view{argv[i]} == "--fit") {
+            try { fit = parse_fit(argv[++i]); }
+            catch (const std::invalid_argument & error) { std::cerr << error.what() << '\n'; return 2; }
+        }
+        else if (std::string_view{argv[i]} == "--no-fit") fit = skintokens::skeleton_fit::none;
         else if (std::string_view{argv[i]} == "--raw-learned") generation.surface_postprocess = false;
         else if (std::string_view{argv[i]} == "--postprocess") generation.surface_postprocess = true;
         else if (std::string_view{argv[i]} == "--beams") generation.beams = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -145,7 +159,7 @@ int main(int argc, char ** argv) {
         else if (std::string_view{argv[i]} == "--max-tokens") generation.max_tokens = std::stoul(argv[++i]);
     }
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--geometric") generation.geometric_only = true;
-    if (argc > 3 && std::string_view{argv[argc - 1]} == "--no-fit") fit = false;
+    if (argc > 3 && std::string_view{argv[argc - 1]} == "--no-fit") fit = skintokens::skeleton_fit::none;
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--supplied-skeleton") supplied_skeleton = true;
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--raw-learned") generation.surface_postprocess = false;
     if (argc > 3 && std::string_view{argv[argc - 1]} == "--postprocess") generation.surface_postprocess = true;
@@ -199,8 +213,8 @@ int main(int argc, char ** argv) {
     if (!geometry) { std::cerr << geometry.error().message << '\n'; return 1; }
     if (!animation) { std::cerr << animation.error().message << '\n'; return 1; }
     if (generation.geometric_only || supplied_skeleton || skin_only) {
-      if (fit) {
-        auto fitted = skintokens::fit_motion_to_mesh(*geometry, *animation);
+      if (fit != skintokens::skeleton_fit::none) {
+        auto fitted = skintokens::fit_motion_to_mesh(*geometry, *animation, fit);
         if (!fitted) { std::cerr << fitted.error().message << '\n'; return 1; }
         animation = std::move(fitted);
       }

@@ -115,11 +115,22 @@ int main() {
     assert(close((*posed_vertices)[1].x, 0.0F) && close((*posed_vertices)[1].y, 1.0F));
     assert(close((*posed_vertices)[2].x, 0.5F) && close((*posed_vertices)[2].y, 1.5F));
     assert(!skintokens::deform_vertices(lbs_geometry, lbs_binding, lbs_animation, 2U));
+    // A fit may place and scale the rest skeleton, but glTF/Kimodo rotations
+    // are already parent-local animation values. In particular, frame zero is
+    // not a bind pose and must never be divided out of the complete track.
+    animation.local_rotations[0] = {0.1F, -0.2F, 0.3F, 0.9F};
+    animation.local_rotations[3] = {-0.3F, 0.1F, 0.2F, 0.9F};
     auto fitted = skintokens::fit_motion_to_mesh(geometry, animation);
     assert(fitted);
     assert(fitted->rig.rest_positions[0].y == 0.0F);
     assert(fitted->rig.rest_positions[1].y == 1.0F);
     assert(fitted->root_translations.front().x == fitted->rig.rest_positions.front().x);
+    for (std::size_t index = 0; index < animation.local_rotations.size(); ++index) {
+        assert(fitted->local_rotations[index].x == animation.local_rotations[index].x);
+        assert(fitted->local_rotations[index].y == animation.local_rotations[index].y);
+        assert(fitted->local_rotations[index].z == animation.local_rotations[index].z);
+        assert(fitted->local_rotations[index].w == animation.local_rotations[index].w);
+    }
     skintokens::motion soma_animation;
     soma_animation.frames = 1U;
     soma_animation.rig.names = {"Hips", "LeftArm", "LeftForeArm", "LeftHand", "LeftHandMiddleEnd"};
@@ -130,10 +141,110 @@ int main() {
     soma_animation.local_rotations.assign(5U, {});
     auto fitted_soma = skintokens::fit_motion_to_mesh(geometry, soma_animation);
     assert(fitted_soma);
-    assert(fitted_soma->rig.rest_positions[2].y < fitted_soma->rig.rest_positions[1].y);
-    assert(fitted_soma->rig.rest_positions[3].y < fitted_soma->rig.rest_positions[2].y);
-    assert(close(fitted_soma->rig.rest_positions[4].y, fitted_soma->rig.rest_positions[3].y));
-    assert(fitted_soma->rig.rest_positions[4].x > fitted_soma->rig.rest_positions[3].x);
+    assert(close(fitted_soma->rig.rest_positions[1].y, fitted_soma->rig.rest_positions[2].y));
+    assert(close(fitted_soma->rig.rest_positions[2].y, fitted_soma->rig.rest_positions[3].y));
+    const auto distance = [](skintokens::vec3 left, skintokens::vec3 right) {
+        const float x = left.x - right.x, y = left.y - right.y, z = left.z - right.z;
+        return std::sqrt(x*x + y*y + z*z);
+    };
+    const float global_upper = distance(fitted_soma->rig.rest_positions[1], fitted_soma->rig.rest_positions[2]);
+    const float global_lower = distance(fitted_soma->rig.rest_positions[2], fitted_soma->rig.rest_positions[3]);
+    const float global_hand = distance(fitted_soma->rig.rest_positions[3], fitted_soma->rig.rest_positions[4]);
+    auto articulated_soma = skintokens::fit_motion_to_mesh(
+        geometry, soma_animation, skintokens::skeleton_fit::articulated);
+    assert(articulated_soma);
+    assert(articulated_soma->rig.rest_positions[2].y < articulated_soma->rig.rest_positions[1].y);
+    assert(articulated_soma->rig.rest_positions[3].y < articulated_soma->rig.rest_positions[2].y);
+    assert(close(distance(articulated_soma->rig.rest_positions[1], articulated_soma->rig.rest_positions[2]),
+                 global_upper));
+    assert(close(distance(articulated_soma->rig.rest_positions[2], articulated_soma->rig.rest_positions[3]),
+                 global_lower));
+    assert(close(distance(articulated_soma->rig.rest_positions[3], articulated_soma->rig.rest_positions[4]),
+                 global_hand));
+    // Changing the articulated bind offsets must not double-apply that pose to
+    // the animation. With identity source rotations, the rest-frame transfer
+    // maps the articulated rig back onto the original global-fit trajectory.
+    skintokens::mesh articulated_points;
+    articulated_points.vertices = articulated_soma->rig.rest_positions;
+    skintokens::skin articulated_binding;
+    articulated_binding.rig = articulated_soma->rig;
+    for (std::uint16_t joint_index = 0; joint_index < articulated_soma->rig.names.size(); ++joint_index) {
+        articulated_binding.joints.push_back({joint_index, 0U, 0U, 0U});
+        articulated_binding.weights.push_back({1.0F, 0.0F, 0.0F, 0.0F});
+    }
+    auto articulated_pose = skintokens::deform_vertices(
+        articulated_points, articulated_binding, *articulated_soma, 0U);
+    assert(articulated_pose && articulated_pose->size() == fitted_soma->rig.rest_positions.size());
+    for (std::size_t joint_index = 0; joint_index < articulated_pose->size(); ++joint_index)
+        assert(close(distance((*articulated_pose)[joint_index], fitted_soma->rig.rest_positions[joint_index]), 0.0F));
+    // An arm chain that already lies in the mesh is kept rather than replaced
+    // by a bounding-box guess. Covering the whole chain, shoulder included, is
+    // what "already aligned" has to mean: the surface test samples along the
+    // bones, so the fixture edge has to span them.
+    skintokens::mesh aligned_arm_geometry = geometry;
+    aligned_arm_geometry.normals.clear();
+    aligned_arm_geometry.vertices.push_back(fitted_soma->rig.rest_positions[1]);
+    aligned_arm_geometry.vertices.push_back(fitted_soma->rig.rest_positions[3]);
+    aligned_arm_geometry.faces.push_back({0U, 3U, 4U});
+    auto already_aligned = skintokens::fit_motion_to_mesh(
+        aligned_arm_geometry, soma_animation, skintokens::skeleton_fit::articulated);
+    assert(already_aligned);
+    assert(close(already_aligned->rig.rest_positions[2].y, already_aligned->rig.rest_positions[1].y));
+    assert(close(already_aligned->rig.rest_positions[3].y, already_aligned->rig.rest_positions[2].y));
+    // Covering only the joints is not enough. A chord between two endpoints
+    // that both sit on the surface can still leave the volume in between, so
+    // sampling the bones rather than their endpoints must reject this one.
+    skintokens::mesh endpoints_only_geometry = geometry;
+    endpoints_only_geometry.normals.clear();
+    endpoints_only_geometry.vertices.push_back(fitted_soma->rig.rest_positions[2]);
+    endpoints_only_geometry.vertices.push_back(fitted_soma->rig.rest_positions[3]);
+    endpoints_only_geometry.faces.push_back({0U, 3U, 4U});
+    auto endpoints_only = skintokens::fit_motion_to_mesh(
+        endpoints_only_geometry, soma_animation, skintokens::skeleton_fit::articulated);
+    assert(endpoints_only);
+    assert(endpoints_only->rig.rest_positions[2].y < endpoints_only->rig.rest_positions[1].y);
+    // The clip's own first frame is a second length-exact pose of the same
+    // skeleton. Where the supplied T-pose rest sits outside the mesh and that
+    // first frame runs through it, articulated fitting adopts the first frame.
+    // Frame zero then coincides with the bind pose, so the first exported frame
+    // leaves the mesh undeformed instead of snapping it out of the T-pose.
+    skintokens::mesh lowered_arm_geometry;
+    lowered_arm_geometry.vertices = {{-0.1F, 0.0F, 0.0F}, {0.1F, 0.0F, 0.0F},
+                                     {0.1F, 1.0F, 0.0F}, {-0.1F, 1.0F, 0.0F}};
+    lowered_arm_geometry.faces = {{{0U, 1U, 2U}}, {{0U, 2U, 3U}}};
+    skintokens::motion lowered_animation;
+    lowered_animation.frames = 1U;
+    lowered_animation.rig.names = {"Hips", "LeftArm", "LeftForeArm", "LeftHand"};
+    lowered_animation.rig.parents = {-1, 0, 1, 2};
+    lowered_animation.rig.rest_positions = {{0.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F},
+                                            {0.5F, 1.0F, 0.0F}, {1.0F, 1.0F, 0.0F}};
+    lowered_animation.root_translations = {{0.0F, 0.0F, 0.0F}};
+    lowered_animation.local_rotations.assign(4U, {});
+    lowered_animation.local_rotations[1] = {0.0F, 0.0F, -half_sqrt_two, half_sqrt_two};
+    auto kept_t_pose = skintokens::fit_motion_to_mesh(lowered_arm_geometry, lowered_animation);
+    assert(kept_t_pose);
+    assert(close(kept_t_pose->rig.rest_positions[1].y, kept_t_pose->rig.rest_positions[3].y));
+    auto adopted = skintokens::fit_motion_to_mesh(
+        lowered_arm_geometry, lowered_animation, skintokens::skeleton_fit::articulated);
+    assert(adopted);
+    assert(adopted->rig.rest_positions[2].y < adopted->rig.rest_positions[1].y);
+    assert(adopted->rig.rest_positions[3].y < adopted->rig.rest_positions[2].y);
+    assert(close(distance(adopted->rig.rest_positions[1], adopted->rig.rest_positions[2]), 0.5F));
+    assert(close(distance(adopted->rig.rest_positions[2], adopted->rig.rest_positions[3]), 0.5F));
+    skintokens::mesh adopted_points;
+    adopted_points.vertices = adopted->rig.rest_positions;
+    skintokens::skin adopted_binding;
+    adopted_binding.rig = adopted->rig;
+    for (std::uint16_t joint_index = 0; joint_index < adopted->rig.names.size(); ++joint_index) {
+        adopted_binding.joints.push_back({joint_index, 0U, 0U, 0U});
+        adopted_binding.weights.push_back({1.0F, 0.0F, 0.0F, 0.0F});
+    }
+    auto adopted_frame_zero = skintokens::deform_vertices(
+        adopted_points, adopted_binding, *adopted, 0U);
+    assert(adopted_frame_zero && adopted_frame_zero->size() == adopted->rig.rest_positions.size());
+    for (std::size_t joint_index = 0; joint_index < adopted_frame_zero->size(); ++joint_index)
+        assert(close(distance((*adopted_frame_zero)[joint_index],
+                              adopted->rig.rest_positions[joint_index]), 0.0F));
     skintokens::skeleton generated_rig;
     generated_rig.names = {"bone_0", "bone_1", "bone_2"};
     generated_rig.parents = {-1, 0, 1};

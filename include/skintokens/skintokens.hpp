@@ -97,6 +97,12 @@ struct motion {
 
 enum class rig_kind : std::uint8_t { unknown, soma30, mixamo52 };
 
+// How a separately supplied skeleton is placed into a mesh coordinate system.
+// `global_similarity` preserves every relative joint position. `articulated`
+// may instead adopt the clip's own first frame as the rest pose, and reposes
+// recognized limb chains that still miss the mesh. Both preserve bone lengths.
+enum class skeleton_fit : std::uint8_t { none, global_similarity, articulated };
+
 struct glb_info {
     bool has_mesh = false;
     bool has_skin = false;
@@ -204,11 +210,20 @@ private:
 
 [[nodiscard]] SKINTOKENS_API rig_kind identify_rig(const skeleton & value);
 
-// Uniformly fits a motion rig to the mesh's vertical extent and centre. This
-// is useful when a motion-only Kimodo skeleton and a separately generated
-// Trellis character do not share an asset coordinate system.
+// Uniformly fits a motion rig to the mesh's vertical extent and centre while
+// preserving every bone length ratio. This is the conservative default for a
+// motion-only Kimodo skeleton and a separately generated character.
 [[nodiscard]] SKINTOKENS_API result<motion> fit_motion_to_mesh(
     const mesh & geometry, const motion & animation);
+
+// Explicit fit selection. The articulated mode first chooses between the
+// supplied rest pose and the clip's own first frame by which one actually runs
+// inside the mesh's arms, then applies a bounded analytic two-bone pose fit to
+// any recognized arm chain that still misses. Adopting the first frame makes
+// the bind pose and frame zero identical, so playback starts without warping
+// the mesh. Every mode preserves the globally scaled length of every bone.
+[[nodiscard]] SKINTOKENS_API result<motion> fit_motion_to_mesh(
+    const mesh & geometry, const motion & animation, skeleton_fit fit);
 
 // Transfers a motion onto a mesh-specific SkinTokens rig by matching its
 // generated rest-pose topology and normalized joint positions. Root travel is

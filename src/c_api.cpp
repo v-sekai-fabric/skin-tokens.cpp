@@ -206,7 +206,8 @@ extern "C" st_status st_skin_files(st_model * value, const char * mesh_path,
                                      char * error, size_t error_capacity) try {
     if (value == nullptr || mesh_path == nullptr || skeleton_path == nullptr || output_path == nullptr ||
         mesh_path[0] == '\0' || skeleton_path[0] == '\0' || output_path[0] == '\0' ||
-        (fit_skeleton_to_mesh != 0 && fit_skeleton_to_mesh != 1) || !valid_generation(options))
+        fit_skeleton_to_mesh < ST_FIT_NONE || fit_skeleton_to_mesh > ST_FIT_ARTICULATED ||
+        !valid_generation(options))
         return fail(value, ST_INVALID_ARGUMENT, "model, mesh, skeleton, output, and valid options are required", error, error_capacity);
     const auto target = options == nullptr ? ST_TARGET_SOMA30 : options->target_rig;
     if (target == ST_TARGET_GENERATED)
@@ -218,8 +219,10 @@ extern "C" st_status st_skin_files(st_model * value, const char * mesh_path,
     if (!mesh) return fail(value, status(mesh.error().code), mesh.error().message, error, error_capacity);
     auto motion = skintokens::load_skeleton_glb_file(skeleton_path);
     if (!motion) return fail(value, status(motion.error().code), motion.error().message, error, error_capacity);
-    if (fit_skeleton_to_mesh != 0) {
-        auto fitted = skintokens::fit_motion_to_mesh(*mesh, *motion);
+    if (fit_skeleton_to_mesh != ST_FIT_NONE) {
+        const auto fit = fit_skeleton_to_mesh == ST_FIT_ARTICULATED ?
+            skintokens::skeleton_fit::articulated : skintokens::skeleton_fit::global_similarity;
+        auto fitted = skintokens::fit_motion_to_mesh(*mesh, *motion, fit);
         if (!fitted) return fail(value, status(fitted.error().code), fitted.error().message, error, error_capacity);
         motion = std::move(fitted);
     }

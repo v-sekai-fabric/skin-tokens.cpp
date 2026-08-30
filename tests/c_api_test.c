@@ -14,6 +14,9 @@ int main(void) {
     assert(generation.max_tokens >= 4U);
     assert(generation.target_rig == ST_TARGET_SOMA30);
     assert(generation.surface_postprocess == 0);
+    assert(ST_FIT_NONE == 0);
+    assert(ST_FIT_GLOBAL_SIMILARITY == 1);
+    assert(ST_FIT_ARTICULATED == 2);
     char error[12] = {0};
     st_model *model = (st_model *)(uintptr_t)1;
     const st_status result = st_model_load(NULL, NULL, &model, error, sizeof(error));

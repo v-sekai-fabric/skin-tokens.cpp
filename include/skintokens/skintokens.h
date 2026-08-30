@@ -50,6 +50,12 @@ typedef enum st_rig_kind {
     ST_RIG_MIXAMO52 = 2
 } st_rig_kind;
 
+typedef enum st_skeleton_fit {
+    ST_FIT_NONE = 0,
+    ST_FIT_GLOBAL_SIMILARITY = 1,
+    ST_FIT_ARTICULATED = 2
+} st_skeleton_fit;
+
 typedef struct st_runtime_options {
     st_device device;
     uint32_t threads;
@@ -122,7 +128,9 @@ ST_API st_status st_rig_file(st_model * value, const char * mesh_path,
 /* Generate learned skin weights for a supplied armature. skeleton_path may
  * equal mesh_path when both are stored in one GLB. Static and animated
  * armatures are accepted. target_rig=SOMA30 preserves the supplied hierarchy;
- * target_rig=MIXAMO52 is accepted only for a detected SOMA30 hierarchy. */
+ * target_rig=MIXAMO52 is accepted only for a detected SOMA30 hierarchy.
+ * fit_skeleton_to_mesh accepts st_skeleton_fit values; the historical value
+ * 1 now selects the conservative global-similarity fit. */
 ST_API st_status st_skin_files(st_model * value, const char * mesh_path,
                                const char * skeleton_path, const char * output_path,
                                int fit_skeleton_to_mesh,

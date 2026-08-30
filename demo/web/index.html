@@ -52,6 +52,10 @@
           <label class="file"><input id="skeleton" type="file" accept=".glb,model/gltf-binary"><b>Choose skeleton GLB</b><small id="skeletonName">No file selected</small></label>
           <div id="skeletonInfo" class="inspection" hidden></div>
         </div>
+        <label class="check card">
+          <input id="articulatedFit" type="checkbox">
+          <span><b>Articulated pose fitting</b><small>Experimental: reposes recognized arm chains only when they do not already align with the mesh, using length-preserving two-bone IK. Leave off for the default global scale and translation.</small></span>
+        </label>
       </div>
 
       <label id="retargetOption" class="check card" hidden>
@@ -59,6 +63,11 @@
         <span><b>Retarget SOMA30 to Mixamo52</b><small>A SOMA30 hierarchy was detected. Leave this off to preserve it.</small></span>
       </label>
     </section>
+
+    <label class="check card">
+      <input id="postprocess" type="checkbox">
+      <span><b>Surface-locality postprocess</b><small>Optionally suppress learned influences that are distant across the mesh surface. Upstream defaults this off.</small></span>
+    </label>
 
     <button id="generate">Generate rig</button>
     <div id="status" class="status">Ready</div>
