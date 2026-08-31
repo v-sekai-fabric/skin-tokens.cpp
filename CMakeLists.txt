@@ -15,7 +15,10 @@ option(SKINTOKENS_DYNAMIC_BACKENDS "Load CPU/Vulkan backends dynamically" ON)
 option(SKINTOKENS_CPU_ALL_VARIANTS "Build portable CPU backend variants" ON)
 option(SKINTOKENS_SANITIZE "Enable ASan and UBSan" OFF)
 option(SKINTOKENS_FUZZ "Build parser fuzzers" OFF)
+option(SKINTOKENS_APPLY_GGML_PATCHES "Apply bundled patches to an isolated GGML build copy" ON)
 set(SKINTOKENS_GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml" CACHE PATH "Pinned GGML submodule")
+set(SKINTOKENS_GGML_PATCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml" CACHE PATH "Ordered GGML patches")
+set(SKINTOKENS_GGML_BASE_REVISION "8c63e70982c95ceb862e3a1073a2c1beef75d60a" CACHE STRING "GGML revision required by bundled patches")
 set(SKINTOKENS_PARITY_MODEL_DIR "" CACHE PATH "GGUF bundle for opt-in full binding parity tests")
 set(SKINTOKENS_PARITY_FIXTURE_DIR "" CACHE PATH "Captured final upstream binding fixture")
 set(SKINTOKENS_QWEN_FIXTURE_DIR "" CACHE PATH "Captured TokenRig generation fixture")
@@ -33,6 +36,38 @@ endif()
 if(NOT EXISTS "${SKINTOKENS_GGML_SOURCE_DIR}/CMakeLists.txt")
   message(FATAL_ERROR "Initialize the ggml git submodule or set SKINTOKENS_GGML_SOURCE_DIR")
 endif()
+set(SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR "${SKINTOKENS_GGML_SOURCE_DIR}")
+if(SKINTOKENS_APPLY_GGML_PATCHES)
+  include(cmake/PrepareGGML.cmake)
+  skintokens_prepare_ggml(SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR
+    SOURCE_DIR "${SKINTOKENS_GGML_SOURCE_DIR}"
+    PATCH_DIR "${SKINTOKENS_GGML_PATCH_DIR}"
+    OUTPUT_DIR "${CMAKE_BINARY_DIR}/_deps/ggml-patched-src"
+    EXPECTED_REVISION "${SKINTOKENS_GGML_BASE_REVISION}")
+else()
+  message(WARNING "Building GGML without the bundled Vulkan correctness patches")
+endif()
+# GGML builds its shader generator through a nested CMake project. If the
+# effective source changes (for example when upgrading from the historical
+# in-place submodule build), discard only GGML's binary subtree so its nested
+# cache cannot retain the previous source path.
+set(SKINTOKENS_GGML_SOURCE_MARKER "${CMAKE_BINARY_DIR}/.skintokens-ggml-source")
+set(SKINTOKENS_RESET_GGML_BINARY_DIR FALSE)
+if(EXISTS "${SKINTOKENS_GGML_SOURCE_MARKER}")
+  file(READ "${SKINTOKENS_GGML_SOURCE_MARKER}" SKINTOKENS_PREVIOUS_GGML_SOURCE)
+  string(STRIP "${SKINTOKENS_PREVIOUS_GGML_SOURCE}" SKINTOKENS_PREVIOUS_GGML_SOURCE)
+  if(NOT SKINTOKENS_PREVIOUS_GGML_SOURCE STREQUAL SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR)
+    set(SKINTOKENS_RESET_GGML_BINARY_DIR TRUE)
+  endif()
+elseif(EXISTS "${CMAKE_BINARY_DIR}/ggml")
+  set(SKINTOKENS_RESET_GGML_BINARY_DIR TRUE)
+endif()
+if(SKINTOKENS_RESET_GGML_BINARY_DIR)
+  message(STATUS "Resetting GGML build metadata for the prepared source tree")
+  file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/ggml")
+endif()
+file(WRITE "${SKINTOKENS_GGML_SOURCE_MARKER}"
+  "${SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR}\n")
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
@@ -42,7 +77,7 @@ set(GGML_CPU_ALL_VARIANTS ${SKINTOKENS_CPU_ALL_VARIANTS} CACHE BOOL "" FORCE)
 if(SKINTOKENS_DYNAMIC_BACKENDS)
   set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 endif()
-add_subdirectory("${SKINTOKENS_GGML_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
+add_subdirectory("${SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
 
 # GGML records its public headers as paths relative to the submodule root.
 # This parent project owns the install rule (the subdirectory is excluded from
@@ -55,7 +90,7 @@ foreach(header IN LISTS SKINTOKENS_GGML_PUBLIC_HEADERS)
     list(APPEND SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE "${header}")
   else()
     list(APPEND SKINTOKENS_GGML_PUBLIC_HEADERS_ABSOLUTE
-      "${SKINTOKENS_GGML_SOURCE_DIR}/${header}")
+      "${SKINTOKENS_GGML_EFFECTIVE_SOURCE_DIR}/${header}")
   endif()
 endforeach()
 set_target_properties(ggml PROPERTIES

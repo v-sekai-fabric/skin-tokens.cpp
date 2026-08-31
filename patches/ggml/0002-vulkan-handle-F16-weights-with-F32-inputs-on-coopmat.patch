@@ -1,0 +1,40 @@
+From 0aa288d2c2e04c6169e52b330228b9004297afba Mon Sep 17 00:00:00 2001
+From: Richard Palethorpe <io@richiejp.com>
+Date: Fri, 28 Aug 2026 21:56:12 +0100
+Subject: [PATCH 2/2] vulkan: handle F16 weights with F32 inputs on coopmat2
+
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index f89ac5c8..11de1bb6 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -9207,7 +9207,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     const bool precise_f32 = (ggml_prec) dst->op_params[0] == GGML_PREC_F32;
+     const bool x_non_contig = (ctx->device->coopmat2 && !precise_f32 && src0->type == GGML_TYPE_F32) ||
+                               !ggml_vk_dim01_contiguous(src0);
+-    const bool y_non_contig = (ctx->device->coopmat2 && !precise_f32 && src1->type == GGML_TYPE_F32) ||
++    // coopmat2 does not create a mixed F16 x F32 matmul pipeline. When the
++    // weights are F16, convert the F32 operand to the available F16 x F16
++    // layout even if the graph requested precise accumulation; otherwise
++    // pipeline selection dereferences the empty pipeline_matmul_f16_f32.
++    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32 &&
++                               (!precise_f32 || src0->type == GGML_TYPE_F16)) ||
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+ 
+@@ -9238,7 +9243,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     // Not implemented
+     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+ 
+-    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
++    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 :
++        (qy_needs_dequant ? f16_type : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
+ 
+     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+-- 
+2.54.0
+

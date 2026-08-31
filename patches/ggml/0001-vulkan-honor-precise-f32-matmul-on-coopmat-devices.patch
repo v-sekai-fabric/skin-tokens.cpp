@@ -1,0 +1,99 @@
+From bf0d606c9fff379f9aa6921dc0867de3019e41fb Mon Sep 17 00:00:00 2001
+From: Richard Palethorpe <io@richiejp.com>
+Date: Fri, 28 Aug 2026 08:14:53 +0100
+Subject: [PATCH 1/2] vulkan: honor precise f32 matmul on coopmat devices
+
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 38 ++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 585e10d4..f89ac5c8 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -892,6 +892,9 @@ struct vk_device_struct {
+     vk::DescriptorSetLayout dsl;
+ 
+     vk_matmul_pipeline pipeline_matmul_f32 {};
++    // Scalar F32 pipeline retained on cooperative-matrix devices for callers
++    // that explicitly request GGML_PREC_F32.
++    vk_matmul_pipeline pipeline_matmul_f32_precise {};
+     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
+     vk_matmul_pipeline pipeline_matmul_bf16 {};
+     vk_matmul_pipeline2 pipeline_matmul_f16;
+@@ -4371,6 +4374,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     if (!device->pipeline_matmul_f32) {
+         device->pipeline_matmul_f32 = std::make_shared<vk_matmul_pipeline_struct>();
+     }
++    if (!device->pipeline_matmul_f32_precise) {
++        device->pipeline_matmul_f32_precise = std::make_shared<vk_matmul_pipeline_struct>();
++    }
+     if (!device->pipeline_matmul_f32_f16) {
+         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
+     }
+@@ -5159,12 +5165,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4].f32acc,   matmul_id_nvfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+         }
+     }
+-    // reusing CREATE_MM from the fp32 path
+-    if ((device->coopmat2 || device->coopmat_support)
+-#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+-        && !device->coopmat_bf16_support
+-#endif
+-        ) {
++    // Reuse the scalar CREATE_MM variant from the fp32 path. Cooperative
++    // matrix devices normally only retain their faster pipeline, but callers
++    // requesting GGML_PREC_F32 must have a path that does not reformat F32
++    // operands through F16.
++    if (device->coopmat2 || device->coopmat_support) {
+         const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+ 
+         // use scalar tile sizes
+@@ -5176,8 +5181,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         m_wg_denoms = { 64,  64, 1 };
+         s_wg_denoms = { 32,  32, 1 };
+ 
++        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_precise, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
++#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
++        if (!device->coopmat_bf16_support) {
++            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++        }
++#else
+         CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++#endif
+     }
+ #undef CREATE_MM
+ 
+@@ -7674,7 +7687,9 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
+ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
+     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+-        return ctx->device->pipeline_matmul_f32;
++        const bool cooperative = ctx->device->coopmat2 || ctx->device->coopmat_support;
++        return prec == GGML_PREC_F32 && cooperative ?
++            ctx->device->pipeline_matmul_f32_precise : ctx->device->pipeline_matmul_f32;
+     }
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
+         return ctx->device->pipeline_matmul_f32_f16;
+@@ -9186,10 +9201,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+         src1_uma = d_Qy != nullptr;
+     }
+ 
+-    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
+-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
++    // The coopmat2 layout reformats F32 through F16. Keep contiguous F32
++    // operands intact when the graph explicitly requests the scalar precise
++    // pipeline above.
++    const bool precise_f32 = (ggml_prec) dst->op_params[0] == GGML_PREC_F32;
++    const bool x_non_contig = (ctx->device->coopmat2 && !precise_f32 && src0->type == GGML_TYPE_F32) ||
+                               !ggml_vk_dim01_contiguous(src0);
+-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
++    const bool y_non_contig = (ctx->device->coopmat2 && !precise_f32 && src1->type == GGML_TYPE_F32) ||
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+ 
+-- 
+2.54.0
+

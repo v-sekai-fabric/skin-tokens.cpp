@@ -22,6 +22,14 @@ cmake --build build/release -j
 cmake --install build/release --prefix ./dist
 ```
 
+The `ggml/` submodule is pinned to an official upstream commit. During CMake
+configuration, the project copies it into the build directory and applies the
+ordered compatibility patches in `patches/ggml/`; the submodule checkout is
+never modified. Reconfiguration reuses the prepared copy while the upstream
+revision and patch hashes are unchanged. Advanced builds using a GGML tree that
+already contains equivalent fixes can pass
+`-DSKINTOKENS_APPLY_GGML_PATCHES=OFF`.
+
 The install contains the shared library, C and C++ headers, CLI, GGML runtime,
 and enabled dynamic backends. To test from the build tree:
 
