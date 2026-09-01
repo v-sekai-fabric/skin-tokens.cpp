@@ -1,10 +1,31 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 )
+
+func TestStaticAssetsDisableCaching(t *testing.T) {
+	handler := noStoreFiles(fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("demo")},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("static response status = %d", response.Code)
+	}
+	if value := response.Header().Get("Cache-Control"); value != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", value)
+	}
+	if body := response.Body.String(); body != "demo" {
+		t.Fatalf("static response body = %q", body)
+	}
+}
 
 func TestRestorePostprocessHistory(t *testing.T) {
 	directory := t.TempDir()

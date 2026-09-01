@@ -23,6 +23,37 @@ extern "C" {
 #endif
 
 typedef struct st_model st_model;
+typedef struct st_retarget_options st_retarget_options;
+typedef struct st_humanoid_match st_humanoid_match;
+
+typedef uint32_t st_finger_transfer;
+#define ST_FINGER_TRANSFER_NEUTRAL UINT32_C(0)
+#define ST_FINGER_TRANSFER_MAP_SOMA_ENDPOINTS UINT32_C(1)
+
+typedef uint32_t st_semantic_role;
+#define ST_ROLE_UNMAPPED UINT32_C(0)
+#define ST_ROLE_HIPS UINT32_C(1)
+#define ST_ROLE_SPINE1 UINT32_C(2)
+#define ST_ROLE_SPINE2 UINT32_C(3)
+#define ST_ROLE_CHEST UINT32_C(4)
+#define ST_ROLE_NECK UINT32_C(5)
+#define ST_ROLE_HEAD UINT32_C(6)
+#define ST_ROLE_LEFT_SHOULDER UINT32_C(7)
+#define ST_ROLE_LEFT_UPPER_ARM UINT32_C(8)
+#define ST_ROLE_LEFT_FOREARM UINT32_C(9)
+#define ST_ROLE_LEFT_HAND UINT32_C(10)
+#define ST_ROLE_RIGHT_SHOULDER UINT32_C(11)
+#define ST_ROLE_RIGHT_UPPER_ARM UINT32_C(12)
+#define ST_ROLE_RIGHT_FOREARM UINT32_C(13)
+#define ST_ROLE_RIGHT_HAND UINT32_C(14)
+#define ST_ROLE_LEFT_UPPER_LEG UINT32_C(15)
+#define ST_ROLE_LEFT_SHIN UINT32_C(16)
+#define ST_ROLE_LEFT_FOOT UINT32_C(17)
+#define ST_ROLE_LEFT_TOE UINT32_C(18)
+#define ST_ROLE_RIGHT_UPPER_LEG UINT32_C(19)
+#define ST_ROLE_RIGHT_SHIN UINT32_C(20)
+#define ST_ROLE_RIGHT_FOOT UINT32_C(21)
+#define ST_ROLE_RIGHT_TOE UINT32_C(22)
 
 typedef enum st_status {
     ST_OK = 0,
@@ -150,6 +181,64 @@ ST_API st_status st_bind_files(st_model * value, const char * mesh_path,
                                const char * kimodo_motion_path, const char * output_path,
                                const st_generation_options * options, int * learned,
                                char * error, size_t error_capacity);
+
+/* PureGo-friendly retarget configuration. These are opaque heap objects:
+ * callers do not need to duplicate any compiler-dependent structure layout.
+ * All scalar access uses fixed-width values and checked getters/setters. */
+ST_API st_status st_retarget_options_create(st_retarget_options ** output,
+                                            char * error, size_t error_capacity);
+ST_API void st_retarget_options_free(st_retarget_options * value);
+ST_API st_status st_retarget_options_set_minimum_confidence(
+    st_retarget_options * value, float confidence, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_get_minimum_confidence(
+    const st_retarget_options * value, float * output, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_set_allow_flexible_hands(
+    st_retarget_options * value, int enabled, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_get_allow_flexible_hands(
+    const st_retarget_options * value, int * output, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_set_finger_transfer(
+    st_retarget_options * value, st_finger_transfer mode, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_get_finger_transfer(
+    const st_retarget_options * value, st_finger_transfer * output,
+    char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_set_scale_root_motion(
+    st_retarget_options * value, int enabled, char * error, size_t error_capacity);
+ST_API st_status st_retarget_options_get_scale_root_motion(
+    const st_retarget_options * value, int * output, char * error, size_t error_capacity);
+
+/* Analyze a generated SkinTokens GLB once, then optionally reuse the match
+ * for retargeting. Hand terminal subtrees may differ; the recognized core is
+ * exposed only through stable scalar getters. */
+ST_API st_status st_humanoid_match_glb_file(
+    const char * generated_rigged_glb, const st_retarget_options * options,
+    st_humanoid_match ** output, char * error, size_t error_capacity);
+ST_API void st_humanoid_match_free(st_humanoid_match * value);
+ST_API st_status st_humanoid_match_get_confidence(
+    const st_humanoid_match * value, float * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_core_score(
+    const st_humanoid_match * value, float * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_alternative_margin(
+    const st_humanoid_match * value, float * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_mapped_core_joint_count(
+    const st_humanoid_match * value, uint64_t * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_ignored_terminal_joint_count(
+    const st_humanoid_match * value, uint64_t * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_generated_joint_count(
+    const st_humanoid_match * value, uint64_t * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_generated_joint_role(
+    const st_humanoid_match * value, uint64_t generated_joint,
+    st_semantic_role * output, char * error, size_t error_capacity);
+ST_API st_status st_humanoid_match_get_soma30_target_joint(
+    const st_humanoid_match * value, uint32_t soma30_joint,
+    int64_t * output, char * error, size_t error_capacity);
+
+/* Retargets SOMA30 motion onto an already-generated SkinTokens rig while
+ * preserving its hierarchy, bind pose, mesh, and learned skin weights.
+ * match may be NULL to analyze the generated GLB in the same call. */
+ST_API st_status st_retarget_soma30_glb_files(
+    const char * generated_rigged_glb, const char * soma30_motion_glb,
+    const char * output_glb, const st_humanoid_match * match,
+    const st_retarget_options * options, char * error, size_t error_capacity);
 
 #ifdef __cplusplus
 }

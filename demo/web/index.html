@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SkinTokens · LocalAI</title>
-  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/app.css?v=20260901-2">
 </head>
 <body>
 <main>
@@ -25,6 +25,12 @@
         <h2>Unrigged mesh</h2>
         <p class="hint">Upload a triangle mesh. SkinTokens will generate its skeleton and learned vertex weights.</p>
         <label class="file"><input id="rigMesh" type="file" accept=".glb,model/gltf-binary"><b>Choose mesh GLB</b><small id="rigMeshName">No file selected</small></label>
+      </div>
+      <div class="card">
+        <h2>Driving motion <span class="optional">optional</span></h2>
+        <p class="hint">Add an animated Kimodo SOMA30 GLB to transfer its body motion onto the generated, mesh-fitted skeleton. Different generated hand branches remain neutral.</p>
+        <div class="file-row"><label class="file"><input id="rigMotion" type="file" accept=".glb,model/gltf-binary"><b>Choose SOMA30 animation GLB</b><small id="rigMotionName">No motion selected</small></label><button id="clearRigMotion" type="button" hidden>Clear</button></div>
+        <div id="rigMotionInfo" class="inspection" hidden></div>
       </div>
     </section>
 
@@ -90,17 +96,20 @@
     <div class="empty" id="empty">Upload a GLB or choose a completed generation</div>
     <div class="compare-labels" id="compareLabels" hidden><span id="meshLabel">Mesh</span><span id="skeletonLabel">Skeleton</span></div>
     <div class="joint-hover" id="jointHover" hidden></div>
+    <div class="divergence" id="divergence" hidden></div>
     <div class="controls">
       <button class="animation-control" id="play" hidden>Pause</button>
       <button class="animation-control" id="rest" hidden>Rest pose</button>
       <button id="reset">Reset view</button>
+      <button id="compareMotion" hidden>Hide comparison</button>
       <a id="download" download="skintokens-result.glb" hidden>Download GLB</a>
+      <a id="nativeDownload" download="skintokens-native-rig.glb" hidden>Native rig</a>
       <input class="animation-control" id="timeline" type="range" min="0" max="1" step=".001" value="0" hidden>
       <span class="animation-control" id="time" hidden>0:00 / 0:00</span>
     </div>
   </section>
 </main>
 <a class="localai" href="https://localai.io" target="_blank" rel="noreferrer" aria-label="LocalAI"><img src="/localai.png" alt="LocalAI"></a>
-<script src="/app.js"></script>
+<script src="/app.js?v=20260901-2"></script>
 </body>
 </html>

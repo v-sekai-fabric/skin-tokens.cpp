@@ -57,6 +57,24 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t * data, std::size_t siz
     (void) st_skin_files(nullptr, path.string().c_str(), path.string().c_str(),
                          path.string().c_str(), 0, nullptr, nullptr,
                          capacity == 0U ? nullptr : error.data(), capacity);
+    st_retarget_options *options = nullptr;
+    (void) st_retarget_options_create(&options,
+        capacity == 0U ? nullptr : error.data(), capacity);
+    if (options != nullptr) {
+        const float confidence = size > 1U ? static_cast<float>(data[1]) / 255.0F : 0.8F;
+        (void) st_retarget_options_set_minimum_confidence(options, confidence,
+            capacity == 0U ? nullptr : error.data(), capacity);
+        (void) st_retarget_options_set_allow_flexible_hands(options, size > 2U ? data[2] & 1U : 1,
+            capacity == 0U ? nullptr : error.data(), capacity);
+        (void) st_retarget_options_set_finger_transfer(options,
+            size > 3U ? data[3] % 2U : ST_FINGER_TRANSFER_NEUTRAL,
+            capacity == 0U ? nullptr : error.data(), capacity);
+        st_humanoid_match *match = nullptr;
+        (void) st_humanoid_match_glb_file(path.string().c_str(), options, &match,
+            capacity == 0U ? nullptr : error.data(), capacity);
+        st_humanoid_match_free(match);
+        st_retarget_options_free(options);
+    }
     (void) st_model_backend_name(nullptr);
     (void) st_model_last_error(nullptr);
     (void) st_abi_version();

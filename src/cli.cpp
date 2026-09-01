@@ -20,6 +20,9 @@ void usage() {
                  " [--postprocess] [--beams N] [--temperature F] [--max-tokens N]\n"
               << "  skintokens-cli glb-info FILE.glb\n"
               << "  skintokens-cli retarget-check SOMA30.glb [MIXAMO52.glb]\n"
+              << "  skintokens-cli retarget-generated GENERATED.glb SOMA30.glb OUTPUT.glb"
+                 " [--minimum-confidence F] [--map-fingers]\n"
+              << "  skintokens-cli retarget-generated-check SOMA30.glb GENERATED.glb\n"
               << "  skintokens-cli prepare-mixamo MESH.glb SOMA30.glb OUTPUT.glb\n"
               << "  skintokens-cli bind MODEL_DIR MESH.{glb,t2mesh} MOTION.glb OUTPUT.glb"
                  " [--device auto|cpu|vulkan] [--geometric|--supplied-skeleton]"
@@ -124,6 +127,61 @@ int main(int argc, char ** argv) {
                   << ",\"frameCount\":" << info->frame_count
                   << ",\"framesPerSecond\":" << info->frames_per_second
                   << ",\"rigKind\":\"" << rig << "\"}\n";
+        return 0;
+    }
+    if (std::string_view{argv[1]} == "retarget-generated") {
+        if (argc < 5) { usage(); return 2; }
+        skintokens::humanoid_match_options match_options;
+        skintokens::retarget_options transfer_options;
+        for (int i = 5; i < argc; ++i) {
+            const std::string_view argument{argv[i]};
+            if (argument == "--minimum-confidence" && i + 1 < argc) {
+                match_options.minimum_confidence = std::stof(argv[++i]);
+                transfer_options.minimum_confidence = match_options.minimum_confidence;
+            } else if (argument == "--map-fingers") {
+                transfer_options.fingers = skintokens::finger_transfer::map_soma_endpoints;
+            } else {
+                std::cerr << "unknown retarget-generated option: " << argument << '\n';
+                return 2;
+            }
+        }
+        auto report = skintokens::retarget_soma30_glb_file(
+            argv[2], argv[3], argv[4], match_options, transfer_options);
+        if (!report) { std::cerr << report.error().message << '\n'; return 1; }
+        std::cout << std::fixed << std::setprecision(3)
+                  << "retargeted SOMA30 motion onto generated rig: confidence "
+                  << report->confidence << ", " << report->mapped_core_joints
+                  << " core joints, " << report->ignored_terminal_joints
+                  << " flexible hand joints\n";
+        return 0;
+    }
+    if (std::string_view{argv[1]} == "retarget-generated-check") {
+        if (argc != 4) { usage(); return 2; }
+        auto source = skintokens::load_kimodo_glb_file(argv[2]);
+        auto target = skintokens::load_kimodo_glb_file(argv[3]);
+        if (!source) { std::cerr << source.error().message << '\n'; return 1; }
+        if (!target) { std::cerr << target.error().message << '\n'; return 1; }
+        auto mapping = skintokens::match_generated_humanoid(target->rig);
+        if (!mapping) { std::cerr << mapping.error().message << '\n'; return 1; }
+        auto report = skintokens::compare_soma30_to_generated(*source, *target, *mapping);
+        if (!report) { std::cerr << report.error().message << '\n'; return 1; }
+        constexpr std::array<std::string_view,30> names{{
+            "Hips","Spine1","Spine2","Chest","Neck1","Neck2","Head","Jaw","LeftEye","RightEye",
+            "LeftShoulder","LeftArm","LeftForeArm","LeftHand","LeftHandThumbEnd","LeftHandMiddleEnd",
+            "RightShoulder","RightArm","RightForeArm","RightHand","RightHandThumbEnd","RightHandMiddleEnd",
+            "LeftLeg","LeftShin","LeftFoot","LeftToeBase","RightLeg","RightShin","RightFoot","RightToeBase"}};
+        std::cout << std::fixed << std::setprecision(7)
+                  << "mean normalized rest-relative displacement error: "
+                  << report->mean_normalized_displacement_error << '\n'
+                  << "maximum normalized rest-relative displacement error: "
+                  << report->maximum_normalized_displacement_error << '\n'
+                  << "worst frame: " << report->worst_frame << '\n'
+                  << "worst joint: " << names[report->worst_soma30_joint]
+                  << " (" << report->worst_soma30_joint << ")\n";
+        for (std::size_t joint=0;joint<names.size();++joint)
+            if (mapping->soma_to_generated[joint]>=0)
+                std::cout << "joint " << names[joint] << ": "
+                          << report->per_joint_maximum[joint] << '\n';
         return 0;
     }
     skintokens::runtime_options runtime;
@@ -242,7 +300,13 @@ int main(int argc, char ** argv) {
         model->bind(*geometry, animation->rig, generation) : model->rig(*geometry, generation);
     if (!binding) { std::cerr << binding.error().message << '\n'; return 1; }
     if (!generation.geometric_only && !supplied_skeleton && !skin_only) {
-        auto retargeted = skintokens::retarget_motion_to_rig(*animation, binding->rig);
+        auto matched = skintokens::match_generated_humanoid(binding->rig);
+        if (!matched) { std::cerr << matched.error().message << '\n'; return 1; }
+        std::cerr << "generated humanoid match: confidence " << matched->report.confidence
+                  << ", " << matched->report.mapped_core_joints << " core joints, "
+                  << matched->report.ignored_terminal_joints << " flexible hand joints\n";
+        auto retargeted = skintokens::retarget_soma30_motion_to_generated(
+            *animation, binding->rig, *matched);
         if (!retargeted) { std::cerr << retargeted.error().message << '\n'; return 1; }
         animation = std::move(retargeted);
     }

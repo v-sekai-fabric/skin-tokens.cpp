@@ -15,6 +15,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t * data, std::size_t siz
     }
     (void) skintokens::load_glb_file(path);
     (void) skintokens::load_kimodo_glb_file(path);
+    (void) skintokens::load_skinned_glb_file(path);
     (void) skintokens::load_trellis_mesh_file(path);
     return 0;
 }

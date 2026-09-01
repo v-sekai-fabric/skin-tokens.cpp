@@ -282,11 +282,125 @@ int main() {
     auto semantic = skintokens::retarget_soma30_to_mixamo52(soma30, *mixamo52);
     assert(semantic && semantic->rig.names.size() == 52U);
     assert(semantic->local_rotations[52U + 7U].z == half_sqrt_two);
+
+    // Unconstrained humanoid recognition keeps the generated body core while
+    // tolerating a different number of terminal finger branches. Simulate a
+    // two-finger-per-hand result by pruning three Mixamo finger chains.
+    skintokens::skeleton flexible_generated;
+    const auto keep_generated_joint = [](std::size_t joint) {
+        return joint <= 15U || (joint >= 25U && joint <= 34U) || joint >= 44U;
+    };
+    std::vector<std::int32_t> old_to_new(mixamo52->names.size(), -1);
+    for (std::size_t joint = 0; joint < mixamo52->names.size(); ++joint) {
+        if (!keep_generated_joint(joint)) continue;
+        old_to_new[joint] = static_cast<std::int32_t>(flexible_generated.names.size());
+        flexible_generated.names.push_back("bone_" + std::to_string(flexible_generated.names.size()));
+        flexible_generated.rest_positions.push_back(mixamo52->rest_positions[joint]);
+        const auto parent = mixamo52->parents[joint];
+        flexible_generated.parents.push_back(parent < 0 ? -1 : old_to_new[static_cast<std::size_t>(parent)]);
+        assert(parent < 0 || flexible_generated.parents.back() >= 0);
+    }
+    auto generated_match = skintokens::match_generated_humanoid(flexible_generated);
+    assert(generated_match);
+    assert(generated_match->report.mapped_core_joints == 22U);
+    assert(generated_match->report.ignored_terminal_joints == 12U);
+    assert(generated_match->soma_to_generated[11U] >= 0);
+    auto generated_motion = skintokens::retarget_soma30_motion_to_generated(
+        soma30, flexible_generated, *generated_match);
+    assert(generated_motion && generated_motion->rig.parents == flexible_generated.parents);
+    assert(generated_motion->frames == soma30.frames);
+    auto generated_divergence = skintokens::compare_soma30_to_generated(
+        soma30, *generated_motion, *generated_match);
+    assert(generated_divergence);
+    assert(std::isfinite(generated_divergence->mean_normalized_displacement_error));
+    assert(std::isfinite(generated_divergence->maximum_normalized_displacement_error));
+    assert(generated_divergence->worst_frame < soma30.frames);
+    const auto generated_left_arm = static_cast<std::size_t>(generated_match->soma_to_generated[11U]);
+    assert(close(generated_motion->local_rotations[flexible_generated.names.size() + generated_left_arm].z,
+                 half_sqrt_two));
+    // An isolated upper-arm track must not manufacture forearm or hand local
+    // rotations merely because their target rest-bone directions differ.
+    const auto generated_left_forearm = static_cast<std::size_t>(generated_match->soma_to_generated[12U]);
+    const auto generated_left_hand_core = static_cast<std::size_t>(generated_match->soma_to_generated[13U]);
+    for (const auto joint : {generated_left_forearm, generated_left_hand_core}) {
+        const auto & local = generated_motion->local_rotations[
+            flexible_generated.names.size() + joint];
+        assert(close(local.x, 0.0F) && close(local.y, 0.0F) &&
+               close(local.z, 0.0F) && close(local.w, 1.0F));
+    }
+    skintokens::motion soma30_fingers = soma30;
+    soma30_fingers.local_rotations[soma30.rig.names.size() + 14U] =
+        {0.0F, 0.0F, half_sqrt_two, half_sqrt_two};
+    skintokens::retarget_options finger_options;
+    finger_options.fingers = skintokens::finger_transfer::map_soma_endpoints;
+    auto finger_motion = skintokens::retarget_soma30_motion_to_generated(
+        soma30_fingers, flexible_generated, *generated_match, finger_options);
+    assert(finger_motion);
+    const auto generated_left_hand = static_cast<std::size_t>(generated_match->soma_to_generated[13U]);
+    std::size_t generated_finger = flexible_generated.names.size();
+    for (std::size_t joint = 0; joint < flexible_generated.names.size(); ++joint)
+        if (flexible_generated.parents[joint] == static_cast<std::int32_t>(generated_left_hand)) {
+            generated_finger = joint;
+            break;
+        }
+    assert(generated_finger < flexible_generated.names.size());
+    assert(std::abs(finger_motion->local_rotations[
+        flexible_generated.names.size() + generated_finger].w) < 0.999F);
+    skintokens::mesh generated_points;
+    generated_points.vertices = flexible_generated.rest_positions;
+    skintokens::skin generated_binding;
+    generated_binding.rig = flexible_generated;
+    for (std::uint16_t joint = 0; joint < flexible_generated.names.size(); ++joint) {
+        generated_binding.joints.push_back({joint, 0U, 0U, 0U});
+        generated_binding.weights.push_back({1.0F, 0.0F, 0.0F, 0.0F});
+    }
+    auto generated_rest = skintokens::deform_vertices(
+        generated_points, generated_binding, *generated_motion, 0U);
+    assert(generated_rest && generated_rest->size() == flexible_generated.rest_positions.size());
+    for (std::size_t joint = 0; joint < generated_rest->size(); ++joint)
+        assert(close(distance((*generated_rest)[joint], flexible_generated.rest_positions[joint]), 0.0F));
+
     auto validation = skintokens::validate_soma30_to_mixamo52(soma30, *mixamo52);
     assert(validation && validation->isolated_cases >= 132U);
     assert(std::isfinite(validation->isolated_mean_position_error));
     assert(std::isfinite(validation->motion_mean_position_error));
     const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto generated_native_path = std::filesystem::temp_directory_path() /
+        ("skintokens-generated-native-" + std::to_string(suffix) + ".glb");
+    const auto soma_motion_path = std::filesystem::temp_directory_path() /
+        ("skintokens-soma-motion-" + std::to_string(suffix) + ".glb");
+    const auto generated_animated_path = std::filesystem::temp_directory_path() /
+        ("skintokens-generated-animated-" + std::to_string(suffix) + ".glb");
+    skintokens::skin generated_file_binding;
+    generated_file_binding.rig = flexible_generated;
+    generated_file_binding.learned = true;
+    generated_file_binding.joints.assign(geometry.vertices.size(), {0U, 0U, 0U, 0U});
+    generated_file_binding.weights.assign(geometry.vertices.size(), {1.0F, 0.0F, 0.0F, 0.0F});
+    skintokens::motion generated_native_motion;
+    generated_native_motion.frames = 1U;
+    generated_native_motion.frames_per_second = 30.0F;
+    generated_native_motion.rig = flexible_generated;
+    generated_native_motion.root_translations = {flexible_generated.rest_positions.front()};
+    generated_native_motion.local_rotations.assign(flexible_generated.names.size(), {});
+    assert(skintokens::save_skinned_animation_glb_file(
+        generated_native_path, geometry, generated_file_binding, generated_native_motion));
+    skintokens::skin soma_file_binding;
+    soma_file_binding.rig = soma30.rig;
+    soma_file_binding.joints.assign(geometry.vertices.size(), {0U, 0U, 0U, 0U});
+    soma_file_binding.weights.assign(geometry.vertices.size(), {1.0F, 0.0F, 0.0F, 0.0F});
+    assert(skintokens::save_skinned_animation_glb_file(
+        soma_motion_path, geometry, soma_file_binding, soma30));
+    auto file_report = skintokens::retarget_soma30_glb_file(
+        generated_native_path, soma_motion_path, generated_animated_path);
+    assert(file_report && file_report->mapped_core_joints == 22U);
+    auto generated_roundtrip = skintokens::load_skinned_glb_file(generated_animated_path);
+    assert(generated_roundtrip && generated_roundtrip->animation.frames == soma30.frames);
+    assert(generated_roundtrip->binding.learned);
+    assert(generated_roundtrip->binding.rig.parents == flexible_generated.parents);
+    assert(generated_roundtrip->binding.joints == generated_file_binding.joints);
+    std::filesystem::remove(generated_native_path);
+    std::filesystem::remove(soma_motion_path);
+    std::filesystem::remove(generated_animated_path);
     const auto output = std::filesystem::temp_directory_path() /
         ("skintokens-api-" + std::to_string(suffix) + ".glb");
     auto saved = skintokens::save_skinned_animation_glb_file(output, geometry, binding, animation);
@@ -296,6 +410,13 @@ int main() {
     auto loaded_motion = skintokens::load_kimodo_glb_file(output);
     assert(loaded_motion && loaded_motion->rig.names.size() == binding.rig.names.size());
     assert(loaded_motion->rig.parents == binding.rig.parents);
+    auto loaded_asset = skintokens::load_skinned_glb_file(output);
+    assert(loaded_asset && loaded_asset->geometry.vertices.size() == geometry.vertices.size());
+    assert(loaded_asset->binding.rig.parents == binding.rig.parents);
+    assert(loaded_asset->binding.joints == binding.joints);
+    for (std::size_t vertex = 0; vertex < binding.weights.size(); ++vertex)
+        for (std::size_t slot = 0; slot < 4U; ++slot)
+            assert(close(loaded_asset->binding.weights[vertex][slot], binding.weights[vertex][slot]));
     std::filesystem::remove(output);
 
     const auto source = std::filesystem::temp_directory_path() /

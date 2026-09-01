@@ -241,6 +241,28 @@ space. It also reports full-clip joint-position and foot-velocity errors. This
 tests retargeting independently of learned skin weights. Retargeting is off by
 default and appears in the demo only after strong SOMA30 detection.
 
+For an unconstrained SkinTokens result, retain its mesh-fitted generated rig
+and learned weights and transfer SOMA30 motion onto that hierarchy afterwards:
+
+```sh
+./build/release/bin/skintokens-cli rig \
+  models/SkinTokens-GGUF/F16 character.glb character-native.glb --device vulkan
+./build/release/bin/skintokens-cli retarget-generated \
+  character-native.glb kimodo-soma30.glb character-animated.glb
+
+./build/release/bin/skintokens-cli retarget-generated-check \
+  kimodo-soma30.glb character-animated.glb
+```
+
+This structural recognizer maps the 22 body joints shared with SOMA30 and
+tolerates different generated hand subtrees. Unmatched fingers inherit the
+hand motion in a neutral local pose by default; `--map-fingers` copies SOMA's
+two endpoint tracks across those branches. Low-confidence or non-humanoid
+generated skeletons are rejected rather than matched by spatial proximity.
+`retarget-generated-check` compares rest-relative joint displacement in body-
+height units and reports the mean, maximum, worst frame, worst joint, and
+per-joint maxima.
+
 Both `.glb` and trellis2cpp's versioned `.t2mesh` are accepted by the CLI as mesh input.
 Skinning should use the manifold-wrapped, quad-remeshed Trellis export, not its dense raw
 marching-cubes reconstruction: the latter is millions of triangles with
@@ -288,6 +310,24 @@ st_status result = st_skin_files(model, "character.glb", "motion.glb",
 st_model_free(model);
 ```
 
+The generated-rig retarget surface uses opaque option and match handles too,
+so PureGo and other FFI callers never have to predict a C structure layout:
+
+```c
+st_retarget_options *options = NULL;
+st_humanoid_match *match = NULL;
+st_retarget_options_create(&options, error, sizeof(error));
+st_retarget_options_set_minimum_confidence(options, 0.85f,
+                                           error, sizeof(error));
+st_humanoid_match_glb_file("character-native.glb", options, &match,
+                           error, sizeof(error));
+st_retarget_soma30_glb_files("character-native.glb", "motion.glb",
+                             "character-animated.glb", match, options,
+                             error, sizeof(error));
+st_humanoid_match_free(match);
+st_retarget_options_free(options);
+```
+
 `st_rig_file` generates a skeleton and weights; `st_skin_files` generates
 weights for a supplied static or animated skeleton. Pass the same GLB as both
 mesh and skeleton paths for a single rigged asset. `st_inspect_glb_file`
@@ -301,11 +341,19 @@ that fuzzer.
 The dependency-free Go/WebGL demo is upload-first. Choose **Skeleton + skin**
 for an unrigged mesh, or **Skin weights only** for either one rigged GLB or
 separate mesh and skeleton GLBs. Kimodo animation GLBs work directly as the
-separate skeleton input. Playback appears only when the supplied hierarchy is
+separate skeleton input. Skeleton + skin also accepts an optional Kimodo
+SOMA30 animation: the demo keeps the generated native rig, transfers the
+motion onto it, and offers both files for download. Playback appears only when the supplied hierarchy is
 animated. Separate inputs default to the length-preserving global fit and offer
 articulated fitting as an experimental checkbox. SOMA30 retargeting appears
 only when that rig is detected. The demo keeps persistent history, runs one
-bounded worker, visualizes joint influences, and exports reusable GLBs.
+bounded worker, visualizes joint influences, and exports reusable GLBs. For a
+generated rig driven by SOMA30, the viewer can overlay the normalized source
+motion in blue, draw the retarget error vectors, and colour mapped joints by
+divergence. Upload selections are retained when switching workflows: an
+unrigged Skeleton + skin mesh becomes the separate character mesh in Skin
+weights only, while a rigged input becomes the one-file asset. The optional
+driving motion has an explicit Clear button.
 
 ```sh
 cd demo

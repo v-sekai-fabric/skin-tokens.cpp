@@ -123,6 +123,69 @@ struct retarget_report {
     float foot_velocity_relative_error = 0.0F;
 };
 
+enum class finger_transfer : std::uint8_t { neutral, map_soma_endpoints };
+
+enum class semantic_role : std::uint8_t {
+    unmapped,
+    hips,
+    spine1,
+    spine2,
+    chest,
+    neck,
+    head,
+    left_shoulder,
+    left_upper_arm,
+    left_forearm,
+    left_hand,
+    right_shoulder,
+    right_upper_arm,
+    right_forearm,
+    right_hand,
+    left_upper_leg,
+    left_shin,
+    left_foot,
+    left_toe,
+    right_upper_leg,
+    right_shin,
+    right_foot,
+    right_toe,
+};
+
+struct humanoid_match_options {
+    float minimum_confidence = 0.80F;
+    bool allow_flexible_hands = true;
+};
+
+struct retarget_options {
+    float minimum_confidence = 0.80F;
+    finger_transfer fingers = finger_transfer::neutral;
+    bool scale_root_motion = true;
+};
+
+struct humanoid_match_report {
+    float confidence = 0.0F;
+    float core_score = 0.0F;
+    float alternative_margin = 0.0F;
+    std::size_t mapped_core_joints = 0;
+    std::size_t ignored_terminal_joints = 0;
+};
+
+struct motion_divergence_report {
+    float mean_normalized_displacement_error = 0.0F;
+    float maximum_normalized_displacement_error = 0.0F;
+    std::size_t worst_frame = 0;
+    std::uint32_t worst_soma30_joint = 0;
+    std::array<float, 30> per_joint_maximum{};
+};
+
+struct humanoid_mapping {
+    // Fixed SOMA30 order. A negative value means that the source joint has no
+    // generated-rig counterpart and its track is intentionally ignored.
+    std::array<std::int32_t, 30> soma_to_generated{};
+    std::vector<semantic_role> generated_roles;
+    humanoid_match_report report;
+};
+
 struct skin {
     skeleton rig;
     // Four normalized influences per source vertex, ready for glTF JOINTS_0
@@ -132,6 +195,12 @@ struct skin {
     // False denotes the deterministic geometric integration baseline. It is
     // never presented as learned TokenRig output.
     bool learned = false;
+};
+
+struct skinned_asset {
+    mesh geometry;
+    skin binding;
+    motion animation;
 };
 
 enum class device_kind : std::uint8_t { automatic, cpu, vulkan };
@@ -204,6 +273,12 @@ private:
 [[nodiscard]] SKINTOKENS_API result<motion> load_skeleton_glb_file(
     const std::filesystem::path & path);
 
+// Loads mesh geometry, JOINTS_0/WEIGHTS_0, skeleton, and optional animation
+// from one bounded GLB. This enables model-independent motion retargeting of a
+// previously generated SkinTokens asset.
+[[nodiscard]] SKINTOKENS_API result<skinned_asset> load_skinned_glb_file(
+    const std::filesystem::path & path);
+
 // Performs bounded structural inspection without loading model weights.
 [[nodiscard]] SKINTOKENS_API result<glb_info> inspect_glb_file(
     const std::filesystem::path & path);
@@ -230,6 +305,36 @@ private:
 // scaled to the target rig while local rotations remain frame-exact.
 [[nodiscard]] SKINTOKENS_API result<motion> retarget_motion_to_rig(
     const motion & animation, const skeleton & target);
+
+// Recognizes the mesh-fitted humanoid core produced by unconstrained
+// SkinTokens generation. Short terminal subtrees below the hands are ignored,
+// allowing the generated rig to contain different numbers of finger branches.
+[[nodiscard]] SKINTOKENS_API result<humanoid_mapping> match_generated_humanoid(
+    const skeleton & generated,
+    const humanoid_match_options & options = {});
+
+// Transfers SOMA30 motion onto the generated hierarchy. The target hierarchy,
+// bind pose, and learned skin weights are not modified.
+[[nodiscard]] SKINTOKENS_API result<motion> retarget_soma30_motion_to_generated(
+    const motion & soma30,
+    const skeleton & generated,
+    const humanoid_mapping & mapping,
+    const retarget_options & options = {});
+
+// Compares motion rather than raw proportions: each corresponding joint is
+// root-relative, height-normalized, and measured against its own rest pose.
+[[nodiscard]] SKINTOKENS_API result<motion_divergence_report>
+compare_soma30_to_generated(
+    const motion & soma30,
+    const motion & generated,
+    const humanoid_mapping & mapping);
+
+[[nodiscard]] SKINTOKENS_API result<humanoid_match_report> retarget_soma30_glb_file(
+    const std::filesystem::path & generated_rigged_glb,
+    const std::filesystem::path & soma30_motion_glb,
+    const std::filesystem::path & output_glb,
+    const humanoid_match_options & match_options = {},
+    const retarget_options & options = {});
 
 // Builds SkinTokens' published Mixamo52 topology from an already fitted
 // SOMA30 rest rig. Body joints are mapped anatomically; SOMA's hand endpoints

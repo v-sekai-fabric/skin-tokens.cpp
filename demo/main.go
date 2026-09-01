@@ -38,22 +38,24 @@ type glbInfo struct {
 }
 
 type record struct {
-	ID            string `json:"id"`
-	Mode          string `json:"mode"`
-	InputLayout   string `json:"inputLayout,omitempty"`
-	MeshName      string `json:"meshName"`
-	SkeletonName  string `json:"skeletonName,omitempty"`
-	State         string `json:"state"`
-	Error         string `json:"error,omitempty"`
-	CreatedAt     int64  `json:"createdAt"`
-	FinishedAt    int64  `json:"finishedAt,omitempty"`
-	Learned       bool   `json:"learned"`
-	HasAnimation  bool   `json:"hasAnimation"`
-	RigKind       string `json:"rigKind,omitempty"`
-	Retargeted    bool   `json:"retargeted,omitempty"`
-	Postprocessed bool   `json:"postprocessed"`
-	FitMode       string `json:"fitMode"`
-	OutputFile    string `json:"outputFile"`
+	ID               string `json:"id"`
+	Mode             string `json:"mode"`
+	InputLayout      string `json:"inputLayout,omitempty"`
+	MeshName         string `json:"meshName"`
+	SkeletonName     string `json:"skeletonName,omitempty"`
+	State            string `json:"state"`
+	Error            string `json:"error,omitempty"`
+	CreatedAt        int64  `json:"createdAt"`
+	FinishedAt       int64  `json:"finishedAt,omitempty"`
+	Learned          bool   `json:"learned"`
+	HasAnimation     bool   `json:"hasAnimation"`
+	RigKind          string `json:"rigKind,omitempty"`
+	Retargeted       bool   `json:"retargeted,omitempty"`
+	Postprocessed    bool   `json:"postprocessed"`
+	FitMode          string `json:"fitMode"`
+	OutputFile       string `json:"outputFile"`
+	NativeFile       string `json:"nativeFile,omitempty"`
+	SourceMotionFile string `json:"sourceMotionFile,omitempty"`
 
 	// Legacy fields keep existing history readable after upgrading the demo.
 	MotionName   string `json:"motionName,omitempty"`
@@ -135,6 +137,25 @@ func oneUpload(r *http.Request, field, directory string) (string, string, error)
 	return path, name, nil
 }
 
+func optionalUpload(r *http.Request, field, directory string) (string, string, error) {
+	values := r.MultipartForm.File[field]
+	if len(values) == 0 {
+		return "", "", nil
+	}
+	if len(values) != 1 {
+		return "", "", errors.New("choose at most one " + field + " GLB")
+	}
+	name := safeName(values[0].Filename)
+	if !strings.EqualFold(filepath.Ext(name), ".glb") {
+		return "", "", errors.New(field + " must be a GLB file")
+	}
+	path := filepath.Join(directory, field+".glb")
+	if err := saveUpload(values[0], path); err != nil {
+		return "", "", err
+	}
+	return path, name, nil
+}
+
 func (s *server) persist(value *record) {
 	data, _ := json.MarshalIndent(value, "", "  ")
 	_ = os.WriteFile(filepath.Join(s.data, value.ID, "manifest.json"), append(data, '\n'), 0o600)
@@ -173,13 +194,20 @@ func (s *server) worker() {
 
 		output := filepath.Join(s.data, id, value.OutputFile)
 		hasAnimation, rigKind := value.HasAnimation, value.RigKind
-		var command *exec.Cmd
+		var commands [][]string
 		if value.Mode == "rig" {
-			arguments := []string{"rig", s.model, value.MeshPath, output, "--device", s.device}
+			rigOutput := output
+			if value.SkeletonPath != "" {
+				rigOutput = filepath.Join(s.data, id, value.NativeFile)
+			}
+			arguments := []string{"rig", s.model, value.MeshPath, rigOutput, "--device", s.device}
 			if value.Postprocessed {
 				arguments = append(arguments, "--postprocess")
 			}
-			command = exec.CommandContext(ctx, s.cli, arguments...)
+			commands = append(commands, arguments)
+			if value.SkeletonPath != "" {
+				commands = append(commands, []string{"retarget-generated", rigOutput, value.SkeletonPath, output})
+			}
 		} else {
 			arguments := []string{"skin", s.model, value.MeshPath, value.SkeletonPath, output,
 				"--device", s.device}
@@ -198,9 +226,19 @@ func (s *server) worker() {
 			if value.Retargeted {
 				arguments = append(arguments, "--retarget-soma-to-mixamo52")
 			}
-			command = exec.CommandContext(ctx, s.cli, arguments...)
+			commands = append(commands, arguments)
 		}
-		combined, err := command.CombinedOutput()
+		var combined []byte
+		var err error
+		for _, arguments := range commands {
+			command := exec.CommandContext(ctx, s.cli, arguments...)
+			part, commandErr := command.CombinedOutput()
+			combined = append(combined, part...)
+			if commandErr != nil {
+				err = commandErr
+				break
+			}
+		}
 		if err == nil {
 			if info, inspectErr := s.inspect(ctx, output); inspectErr == nil {
 				hasAnimation = info.HasAnimation
@@ -337,6 +375,13 @@ func (s *server) generate(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if mode == "rig" {
 		value.MeshPath, value.MeshName, err = oneUpload(r, "mesh", directory)
+		if err == nil {
+			value.SkeletonPath, value.MotionName, err = optionalUpload(r, "motion", directory)
+			if value.SkeletonPath != "" {
+				value.NativeFile = "native.glb"
+				value.SourceMotionFile = "motion.glb"
+			}
+		}
 	} else if layout == "embedded" {
 		value.MeshPath, value.MeshName, err = oneUpload(r, "asset", directory)
 		value.SkeletonPath, value.SkeletonName = value.MeshPath, value.MeshName
@@ -381,6 +426,17 @@ func (s *server) generate(w http.ResponseWriter, r *http.Request) {
 		}
 		value.HasAnimation = skeletonInfo.HasAnimation
 		value.RigKind = skeletonInfo.RigKind
+	} else if value.SkeletonPath != "" {
+		motionInfo, inspectErr := s.inspect(ctx, value.SkeletonPath)
+		if inspectErr != nil {
+			http.Error(w, inspectErr.Error(), 400)
+			return
+		}
+		if !motionInfo.HasAnimation || motionInfo.RigKind != "soma30" {
+			http.Error(w, "optional driving motion must be an animated SOMA30 GLB", 400)
+			return
+		}
+		value.HasAnimation = true
 	}
 
 	s.mu.Lock()
@@ -492,6 +548,11 @@ func restore(directory string) map[string]*record {
 		if value.OutputFile == "" {
 			value.OutputFile = "animation.glb"
 		}
+		if value.Mode == "rig" && value.MotionName != "" && value.SourceMotionFile == "" {
+			if info, err := os.Stat(filepath.Join(directory, value.ID, "motion.glb")); err == nil && info.Mode().IsRegular() {
+				value.SourceMotionFile = "motion.glb"
+			}
+		}
 		if !fitModePresent {
 			if value.Mode == "skin" && value.InputLayout == "separate" {
 				value.FitMode = "legacy-articulated"
@@ -505,6 +566,14 @@ func restore(directory string) map[string]*record {
 		values[value.ID] = &value
 	}
 	return values
+}
+
+func noStoreFiles(filesystem fs.FS) http.Handler {
+	files := http.FileServer(http.FS(filesystem))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		files.ServeHTTP(w, r)
+	})
 }
 
 func main() {
@@ -536,7 +605,7 @@ func main() {
 		log.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("GET /", http.FileServer(http.FS(assets)))
+	mux.Handle("GET /", noStoreFiles(assets))
 	mux.HandleFunc("GET /api/history", s.history)
 	mux.HandleFunc("POST /api/inspect-glb", s.inspectUpload)
 	mux.HandleFunc("POST /api/generate", s.generate)

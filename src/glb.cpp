@@ -204,6 +204,45 @@ result<quat> quaternion(const accessor & value, std::size_t index) {
     return output;
 }
 
+result<std::array<std::uint16_t,4>> joint_vector(const accessor & value,std::size_t index) {
+    if (value.shape!="VEC4" || index>=value.count ||
+        (value.component!=5121U && value.component!=5123U))
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "JOINTS_0 must be an unsigned byte or unsigned short VEC4"));
+    const auto * pointer=value.bytes.data()+index*value.stride;
+    std::array<std::uint16_t,4> output{};
+    for (std::size_t component=0;component<4U;++component)
+        output[component]=value.component==5121U?
+            std::to_integer<std::uint8_t>(pointer[component]):little<std::uint16_t>(pointer+component*2U);
+    return output;
+}
+
+result<std::array<float,4>> weight_vector(const accessor & value,std::size_t index) {
+    if (value.shape!="VEC4" || index>=value.count ||
+        (value.component!=5121U && value.component!=5123U && value.component!=5126U))
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "WEIGHTS_0 must be a supported VEC4"));
+    if (value.component!=5126U && !value.normalized)
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "integer WEIGHTS_0 must be normalized"));
+    const auto * pointer=value.bytes.data()+index*value.stride;
+    std::array<float,4> output{};
+    for (std::size_t component=0;component<4U;++component) {
+        output[component]=value.component==5126U?little<float>(pointer+component*4U):
+            value.component==5123U?static_cast<float>(little<std::uint16_t>(pointer+component*2U))/65535.0F:
+            static_cast<float>(std::to_integer<std::uint8_t>(pointer[component]))/255.0F;
+        if (!std::isfinite(output[component]) || output[component]<0.0F)
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "WEIGHTS_0 contains an invalid value"));
+    }
+    const float sum=output[0]+output[1]+output[2]+output[3];
+    if (sum<=1.0e-12F)
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "WEIGHTS_0 contains an unweighted vertex"));
+    for (auto & weight:output) weight/=sum;
+    return output;
+}
+
 result<color4> color(const accessor & value, std::size_t index) {
     const auto count = components(value.shape);
     if ((count != 3U && count != 4U) || index >= value.count ||
@@ -898,6 +937,152 @@ result<motion> load_kimodo_glb_file(const std::filesystem::path & path) {
     auto doc = read_document(path);
     if (!doc) return std::unexpected(doc.error());
     return load_skeleton_document(*doc, true);
+}
+
+result<skinned_asset> load_skinned_glb_file(const std::filesystem::path & path) {
+    auto doc = read_document(path);
+    if (!doc) return std::unexpected(doc.error());
+    auto geometry = load_glb_file(path);
+    if (!geometry) return std::unexpected(geometry.error());
+    auto animation = load_skeleton_document(*doc, false);
+    if (!animation) return std::unexpected(animation.error());
+
+    const auto skins = doc->root.find("skins");
+    const auto nodes = doc->root.find("nodes");
+    const auto meshes = doc->root.find("meshes");
+    if (skins == doc->root.end() || !skins->is_array() || skins->size() != 1U ||
+        nodes == doc->root.end() || !nodes->is_array() ||
+        meshes == doc->root.end() || !meshes->is_array())
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "rigged GLB must contain exactly one skin and a bounded mesh"));
+    const auto & skin_object = (*skins)[0];
+    if (!skin_object.is_object() || !skin_object.contains("joints") ||
+        !skin_object["joints"].is_array())
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "rigged GLB skin has no joint array"));
+
+    // JOINTS_0 indexes the original skin.joints array. The skeleton loader
+    // normalizes arbitrary glTF joint order so parents precede children; build
+    // the same order here and explicitly remap every vertex influence.
+    std::vector<std::size_t> original_nodes;
+    std::vector<std::int32_t> node_to_original(nodes->size(), -1);
+    for (const auto & value : skin_object["joints"]) {
+        if (!value.is_number_unsigned() || value.get<std::size_t>() >= nodes->size())
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB contains an invalid skin joint"));
+        const auto node = value.get<std::size_t>();
+        if (node_to_original[node] >= 0)
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB contains duplicate skin joints"));
+        node_to_original[node] = static_cast<std::int32_t>(original_nodes.size());
+        original_nodes.push_back(node);
+    }
+    if (original_nodes.size() != animation->rig.names.size())
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "skin and loaded skeleton joint counts differ"));
+    std::vector<std::int32_t> node_parents(nodes->size(), -1);
+    for (std::size_t parent = 0; parent < nodes->size(); ++parent) {
+        const auto children = (*nodes)[parent].find("children");
+        if (children == (*nodes)[parent].end()) continue;
+        if (!children->is_array())
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB node children are invalid"));
+        for (const auto & child : *children) {
+            if (!child.is_number_unsigned() || child.get<std::size_t>() >= nodes->size() ||
+                node_parents[child.get<std::size_t>()] >= 0)
+                return std::unexpected(detail::fail(error_code::invalid_format,
+                    "rigged GLB joint hierarchy is invalid"));
+            node_parents[child.get<std::size_t>()] = static_cast<std::int32_t>(parent);
+        }
+    }
+    std::vector<std::size_t> ordered_nodes;
+    std::vector<bool> added(nodes->size(), false);
+    while (ordered_nodes.size() != original_nodes.size()) {
+        const auto before = ordered_nodes.size();
+        for (const auto node : original_nodes) {
+            if (added[node]) continue;
+            auto parent = node_parents[node];
+            while (parent >= 0 && node_to_original[static_cast<std::size_t>(parent)] < 0)
+                parent = node_parents[static_cast<std::size_t>(parent)];
+            if (parent < 0 || added[static_cast<std::size_t>(parent)]) {
+                ordered_nodes.push_back(node);
+                added[node] = true;
+            }
+        }
+        if (ordered_nodes.size() == before)
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB skin hierarchy contains a cycle"));
+    }
+    std::vector<std::uint16_t> original_to_ordered(original_nodes.size());
+    for (std::size_t ordered = 0; ordered < ordered_nodes.size(); ++ordered)
+        original_to_ordered[static_cast<std::size_t>(node_to_original[ordered_nodes[ordered]])] =
+            static_cast<std::uint16_t>(ordered);
+
+    const json * primitive = nullptr;
+    for (const auto & node : *nodes) {
+        if (!node.is_object() || !node.contains("skin") || !node.contains("mesh")) continue;
+        if (!node["skin"].is_number_unsigned() || node["skin"].get<std::size_t>() != 0U ||
+            !node["mesh"].is_number_unsigned() || node["mesh"].get<std::size_t>() >= meshes->size())
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB mesh node references an invalid skin or mesh"));
+        const auto & mesh_object = (*meshes)[node["mesh"].get<std::size_t>()];
+        if (!mesh_object.is_object() || !mesh_object.contains("primitives") ||
+            !mesh_object["primitives"].is_array())
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                "rigged GLB mesh has no primitives"));
+        for (const auto & candidate : mesh_object["primitives"]) {
+            if (!candidate.is_object() || candidate.value("mode", 4U) != 4U ||
+                !candidate.contains("attributes")) continue;
+            const auto & attributes = candidate["attributes"];
+            if (!attributes.is_object() || !attributes.contains("POSITION") ||
+                !attributes.contains("JOINTS_0") || !attributes.contains("WEIGHTS_0")) continue;
+            if (primitive != nullptr)
+                return std::unexpected(detail::fail(error_code::invalid_format,
+                    "multiple skinned mesh primitives are not supported"));
+            primitive = &candidate;
+        }
+    }
+    if (primitive == nullptr)
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "rigged GLB has no JOINTS_0/WEIGHTS_0 triangle primitive"));
+    const auto & attributes = (*primitive)["attributes"];
+    for (const auto * name : {"POSITION", "JOINTS_0", "WEIGHTS_0"})
+        if (!attributes[name].is_number_unsigned())
+            return std::unexpected(detail::fail(error_code::invalid_format,
+                std::string{"invalid skinned attribute "} + name));
+    auto positions = get_accessor(*doc, attributes["POSITION"].get<std::size_t>());
+    auto joints = get_accessor(*doc, attributes["JOINTS_0"].get<std::size_t>());
+    auto weights = get_accessor(*doc, attributes["WEIGHTS_0"].get<std::size_t>());
+    if (!positions) return std::unexpected(positions.error());
+    if (!joints) return std::unexpected(joints.error());
+    if (!weights) return std::unexpected(weights.error());
+    if (positions->count != geometry->vertices.size() || joints->count != positions->count ||
+        weights->count != positions->count)
+        return std::unexpected(detail::fail(error_code::invalid_format,
+            "skinned attribute counts differ from mesh vertex count"));
+
+    skinned_asset output;
+    output.geometry = std::move(*geometry);
+    output.animation = std::move(*animation);
+    output.binding.rig = output.animation.rig;
+    output.binding.joints.resize(positions->count);
+    output.binding.weights.resize(positions->count);
+    output.binding.learned = skin_object.value("name", std::string{}).find("learned") != std::string::npos;
+    for (std::size_t vertex = 0; vertex < positions->count; ++vertex) {
+        auto joint = joint_vector(*joints, vertex);
+        auto weight = weight_vector(*weights, vertex);
+        if (!joint) return std::unexpected(joint.error());
+        if (!weight) return std::unexpected(weight.error());
+        for (auto & index : *joint) {
+            if (index >= original_to_ordered.size())
+                return std::unexpected(detail::fail(error_code::invalid_format,
+                    "JOINTS_0 influence exceeds skin joint count"));
+            index = original_to_ordered[index];
+        }
+        output.binding.joints[vertex] = *joint;
+        output.binding.weights[vertex] = *weight;
+    }
+    return output;
 }
 
 result<glb_info> inspect_glb_file(const std::filesystem::path & path) {
